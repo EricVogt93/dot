@@ -30,7 +30,7 @@ jobs:
 
   image:
     needs: verify
-    runs-on: general
+    runs-on: arpgcs
     container:
       image: docker:27-cli
     env:
@@ -77,8 +77,8 @@ jobs:
 
   deploy:
     needs: image
+    runs-on: arpgcs
     if: forgejo.ref == 'refs/heads/main' && success()
-    runs-on: general
     container:
       image: alpine:3.20
     env:
