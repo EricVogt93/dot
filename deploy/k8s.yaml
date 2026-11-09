@@ -1,7 +1,7 @@
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: dot-data
+  name: dot-data-ts
   namespace: apps
 spec:
   accessModes: ["ReadWriteOnce"]
@@ -13,7 +13,7 @@ spec:
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: dot-workspace
+  name: dot-workspace-ts
   namespace: apps
 spec:
   accessModes: ["ReadWriteOnce"]
@@ -45,12 +45,7 @@ spec:
       terminationGracePeriodSeconds: 90
       hostname: dot-k3s
       nodeSelector:
-        kubernetes.io/hostname: server
-      tolerations:
-        - key: role
-          operator: Equal
-          value: infra
-          effect: NoSchedule
+        kubernetes.io/hostname: thinkstation-k3s
       imagePullSecrets:
         - name: forgejo-registry
       securityContext:
@@ -125,10 +120,10 @@ spec:
       volumes:
         - name: data
           persistentVolumeClaim:
-            claimName: dot-data
+            claimName: dot-data-ts
         - name: workspace
           persistentVolumeClaim:
-            claimName: dot-workspace
+            claimName: dot-workspace-ts
         - name: auth
           secret:
             secretName: dot-auth
