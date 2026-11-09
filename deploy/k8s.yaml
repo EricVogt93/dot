@@ -46,6 +46,11 @@ spec:
       hostname: dot-k3s
       nodeSelector:
         kubernetes.io/hostname: server
+      tolerations:
+        - key: role
+          operator: Equal
+          value: infra
+          effect: NoSchedule
       imagePullSecrets:
         - name: forgejo-registry
       securityContext:
