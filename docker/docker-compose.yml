@@ -1,0 +1,42 @@
+name: dot
+
+services:
+  dot:
+    build:
+      context: .
+      # This host cannot create Docker bridge interfaces; build with host
+      # networking. Remove if your Docker daemon supports bridge builds.
+      network: host
+      args:
+        CODEX_VERSION: ${CODEX_VERSION:-0.167.0}
+    container_name: ${DOT_CONTAINER_NAME:-dot}
+    hostname: ${DOT_HOSTNAME:-dot-sandbox}
+    init: true
+    restart: unless-stopped
+    # Host networking: this workstation rejects veth/bridge creation. The API
+    # binds 127.0.0.1:${DOT_PORT} directly; no port mapping is needed.
+    network_mode: host
+    volumes:
+      - dot-data:/data
+      - ${DOT_WORKSPACE_HOST:-./workspace}:/workspace
+      - ${DOT_AUTH_FILE:-${HOME}/.codex/auth.json}:/seed/auth.json:ro
+    environment:
+      CODEX_HOME: /data/codex
+      DOT_API_PORT: ${DOT_PORT:-8787}
+      DOT_BIND: ${DOT_BIND:-127.0.0.1}
+      DOT_AUTH_SEED: /seed/auth.json
+      DOT_DEVICE_LOGIN: ${DOT_DEVICE_LOGIN:-1}
+      DOT_MODEL: ${DOT_MODEL:-}
+      DOT_API_KEY: ${DOT_API_KEY:-}
+      DOT_SANDBOX: ${DOT_SANDBOX:-danger-full-access}
+      DOT_APPROVAL_POLICY: ${DOT_APPROVAL_POLICY:-never}
+      DOT_THREAD_MODE: ${DOT_THREAD_MODE:-persistent}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:$${DOT_API_PORT}/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+
+volumes:
+  dot-data:

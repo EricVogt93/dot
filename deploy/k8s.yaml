@@ -1,0 +1,148 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: dot-data
+  namespace: apps
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: dot-workspace
+  namespace: apps
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dot
+  namespace: apps
+  labels:
+    app: dot
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: dot
+  template:
+    metadata:
+      labels:
+        app: dot
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 90
+      hostname: dot-k3s
+      nodeSelector:
+        kubernetes.io/hostname: server
+      imagePullSecrets:
+        - name: forgejo-registry
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: dot
+          image: registry.ericvogt.com/root/dot:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8787
+          env:
+            - name: CODEX_HOME
+              value: /data/codex
+            - name: HOME
+              value: /data
+            - name: DOT_WORKSPACE
+              value: /workspace
+            - name: DOT_API_PORT
+              value: "8787"
+            - name: DOT_BIND
+              value: "0.0.0.0"
+            - name: DOT_AUTH_SEED
+              value: /seed/auth.json
+            - name: DOT_DEVICE_LOGIN
+              value: "0"
+            - name: DOT_SANDBOX
+              value: danger-full-access
+            - name: DOT_APPROVAL_POLICY
+              value: never
+            - name: DOT_THREAD_MODE
+              value: persistent
+            - name: DOT_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: dot-api-key
+                  key: key
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: workspace
+              mountPath: /workspace
+            - name: auth
+              mountPath: /seed
+              readOnly: true
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 30
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 250m
+              memory: 1Gi
+            limits:
+              cpu: "4"
+              memory: 6Gi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: dot-data
+        - name: workspace
+          persistentVolumeClaim:
+            claimName: dot-workspace
+        - name: auth
+          secret:
+            secretName: dot-auth
+            items:
+              - key: auth.json
+                path: auth.json
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dot
+  namespace: apps
+  labels:
+    app: dot
+spec:
+  type: ClusterIP
+  selector:
+    app: dot
+  ports:
+    - name: http
+      port: 8787
+      targetPort: http

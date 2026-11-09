@@ -1,0 +1,11 @@
+{
+  "name": "dot-container",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "OpenAI-compatible HTTP bridge for the Codex app-server",
+  "main": "server.js",
+  "engines": {
+    "node": ">=24"
+  }
+}

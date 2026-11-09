@@ -1,0 +1,110 @@
+name: CI
+
+on:
+  push:
+    branches: [main, development]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: registry.ericvogt.com
+
+jobs:
+  verify:
+    runs-on: infra-light
+    container:
+      image: node:24-bookworm-slim
+    steps:
+      - name: Install tooling
+        run: apt-get update -qq && apt-get install -y -qq --no-install-recommends ca-certificates git
+      - name: Check out repository
+        uses: https://data.forgejo.org/actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Check JavaScript syntax
+        run: node --check docker/server.js
+      - name: Check entrypoint syntax
+        run: bash -n docker/entrypoint.sh
+
+  image:
+    needs: verify
+    runs-on: ts-heavy
+    container:
+      image: docker:27-cli
+    env:
+      REGISTRY_USER: ${{ vars.REGISTRY_USER }}
+      REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+    steps:
+      - name: Install action runtime
+        run: apk add --no-cache git
+      - name: Check out repository
+        uses: https://data.forgejo.org/actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Resolve image tag
+        id: image
+        run: echo "short_sha=$(git rev-parse --short=8 HEAD)" >> "$FORGEJO_OUTPUT"
+      - name: Authenticate to registry
+        run: |
+          : "${REGISTRY_USER:?Forgejo variable REGISTRY_USER is required}"
+          : "${REGISTRY_TOKEN:?Forgejo secret REGISTRY_TOKEN is required}"
+          printf '%s' "$REGISTRY_TOKEN" | docker login "$REGISTRY" --username "$REGISTRY_USER" --password-stdin
+      - name: Build image
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ forgejo.repository }}
+          SHORT_SHA: ${{ steps.image.outputs.short_sha }}
+        run: |
+          docker build --network=host \
+            --tag "$IMAGE:$SHORT_SHA" \
+            --tag "$IMAGE:latest" \
+            docker
+      - name: Push image
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ forgejo.repository }}
+          SHORT_SHA: ${{ steps.image.outputs.short_sha }}
+          TARGET_REF: ${{ forgejo.ref }}
+        run: |
+          if [ "$TARGET_REF" = "refs/heads/main" ]; then
+            docker push "$IMAGE:$SHORT_SHA"
+            docker push "$IMAGE:latest"
+          else
+            docker tag "$IMAGE:$SHORT_SHA" "$IMAGE:dev"
+            docker push "$IMAGE:$SHORT_SHA"
+            docker push "$IMAGE:dev"
+          fi
+
+  deploy:
+    needs: image
+    if: forgejo.ref == 'refs/heads/main'
+    runs-on: ts-heavy
+    container:
+      image: alpine:3.20
+    env:
+      IMAGE: ${{ env.REGISTRY }}/${{ forgejo.repository }}
+      FORGEJO_SHA: ${{ forgejo.sha }}
+      KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+    steps:
+      - name: Install kubectl
+        run: |
+          apk add --no-cache ca-certificates curl
+          curl -fsSLo /usr/local/bin/kubectl \
+            https://dl.k8s.io/release/v1.35.9/bin/linux/amd64/kubectl
+          chmod +x /usr/local/bin/kubectl
+      - name: Write kubeconfig
+        run: |
+          : "${KUBE_CONFIG:?Forgejo secret KUBE_CONFIG is required}"
+          mkdir -p /root/.kube
+          printf '%s' "$KUBE_CONFIG" > /root/.kube/config
+          chmod 600 /root/.kube/config
+      - name: Apply manifests
+        run: kubectl apply -f deploy/k8s.yaml
+      - name: Set deployed image
+        run: |
+          SHORT_SHA="$(printf '%s' "$FORGEJO_SHA" | cut -c1-8)"
+          kubectl -n apps set image deployment/dot "dot=$IMAGE:$SHORT_SHA"
+      - name: Wait for rollout
+        run: |
+          kubectl -n apps rollout status deployment/dot --timeout=300s
+          kubectl -n apps get pods -l app=dot -o wide

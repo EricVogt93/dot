@@ -1,0 +1,6 @@
+data/
+work/
+.env
+*.token
+.gitea-*
+.dot-*
