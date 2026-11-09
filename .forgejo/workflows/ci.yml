@@ -13,7 +13,7 @@ env:
 
 jobs:
   verify:
-    runs-on: infra-light
+    runs-on: general
     container:
       image: node:24-bookworm-slim
     steps:
@@ -30,7 +30,7 @@ jobs:
 
   image:
     needs: verify
-    runs-on: ts-heavy
+    runs-on: general
     container:
       image: docker:27-cli
     env:
@@ -78,7 +78,7 @@ jobs:
   deploy:
     needs: image
     if: forgejo.ref == 'refs/heads/main'
-    runs-on: ts-heavy
+    runs-on: general
     container:
       image: alpine:3.20
     env:
