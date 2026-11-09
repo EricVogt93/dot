@@ -54,7 +54,7 @@ jobs:
           printf '%s' "$REGISTRY_TOKEN" | docker login "$REGISTRY" --username "$REGISTRY_USER" --password-stdin
       - name: Build image
         env:
-          IMAGE: ${{ env.REGISTRY }}/${{ forgejo.repository }}
+          IMAGE: registry.ericvogt.com/${{ forgejo.repository }}
           SHORT_SHA: ${{ steps.image.outputs.short_sha }}
         run: |
           docker build --network=host \
@@ -63,7 +63,7 @@ jobs:
             docker
       - name: Push image
         env:
-          IMAGE: ${{ env.REGISTRY }}/${{ forgejo.repository }}
+          IMAGE: registry.ericvogt.com/${{ forgejo.repository }}
           SHORT_SHA: ${{ steps.image.outputs.short_sha }}
           TARGET_REF: ${{ forgejo.ref }}
         run: |
@@ -83,7 +83,7 @@ jobs:
     container:
       image: alpine:3.20
     env:
-      IMAGE: ${{ env.REGISTRY }}/${{ forgejo.repository }}
+      IMAGE: registry.ericvogt.com/${{ forgejo.repository }}
       FORGEJO_SHA: ${{ forgejo.sha }}
       KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
     steps:
