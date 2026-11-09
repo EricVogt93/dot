@@ -274,8 +274,9 @@ One-time cluster prerequisites (already created in `apps`):
 - `ServiceAccount/dot-deployer` + Role/RoleBinding — CI can manage only
   Deployments, Services, PVCs, ConfigMaps and Pods in `apps`.
 
-The pod is pinned to node `server`, uses local-path PVCs `dot-data` and
-`dot-workspace`, and sets `hostname: dot-k3s` (the ChatGPT device name). The
+The pod is pinned to node `thinkstation-k3s` (ts3), uses local-path PVCs
+`dot-data-ts` and `dot-workspace-ts`, and sets `hostname: dot-k3s` (the ChatGPT
+device name). The
 API is ClusterIP-only; use port-forward:
 
 ```bash
