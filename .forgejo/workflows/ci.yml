@@ -30,9 +30,10 @@ jobs:
 
   image:
     needs: verify
-    runs-on: arpgcs
+    runs-on: general
     container:
       image: docker:27-cli
+      options: -v /run/user/1000/podman/podman.sock:/var/run/docker.sock
     env:
       REGISTRY_USER: ${{ vars.REGISTRY_USER }}
       REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
@@ -77,7 +78,7 @@ jobs:
 
   deploy:
     needs: image
-    runs-on: arpgcs
+    runs-on: general
     if: forgejo.ref == 'refs/heads/main' && success()
     container:
       image: alpine:3.20
@@ -86,9 +87,14 @@ jobs:
       FORGEJO_SHA: ${{ forgejo.sha }}
       KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
     steps:
+      - name: Install action runtime
+        run: apk add --no-cache ca-certificates curl git nodejs
+      - name: Check out repository
+        uses: https://data.forgejo.org/actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
       - name: Install kubectl
         run: |
-          apk add --no-cache ca-certificates curl
           curl -fsSLo /usr/local/bin/kubectl \
             https://dl.k8s.io/release/v1.35.9/bin/linux/amd64/kubectl
           chmod +x /usr/local/bin/kubectl
