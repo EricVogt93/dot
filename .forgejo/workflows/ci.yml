@@ -38,7 +38,7 @@ jobs:
       REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
     steps:
       - name: Install action runtime
-        run: apk add --no-cache git
+        run: apk add --no-cache git nodejs
       - name: Check out repository
         uses: https://data.forgejo.org/actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -77,7 +77,7 @@ jobs:
 
   deploy:
     needs: image
-    if: forgejo.ref == 'refs/heads/main'
+    if: forgejo.ref == 'refs/heads/main' && success()
     runs-on: general
     container:
       image: alpine:3.20
