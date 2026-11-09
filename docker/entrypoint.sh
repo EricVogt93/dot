@@ -100,7 +100,27 @@ start_remote_control() {
 start_remote_control
 
 # ---------------------------------------------------------------------------
-# 5. HTTP API supervisor.
+# 5. Optional Dots/Work local executor (the ChatGPT "Your computer"
+#    connector). Enable with DOT_DOTS_EXECUTOR=1.
+# ---------------------------------------------------------------------------
+DOTS_EXECUTOR_PID=""
+start_dots_executor() {
+  if [[ "${DOT_DOTS_EXECUTOR:-0}" != "1" ]]; then
+    return 0
+  fi
+  if [[ -n "${DOTS_EXECUTOR_PID}" ]] && kill -0 "${DOTS_EXECUTOR_PID}" 2>/dev/null; then
+    return 0
+  fi
+  log "starting Dots local executor connector"
+  /app/dots-executor.sh >>"${CODEX_HOME}/dots-executor.log" 2>&1 &
+  DOTS_EXECUTOR_PID=$!
+  log "dots executor pid=${DOTS_EXECUTOR_PID}"
+}
+
+start_dots_executor
+
+# ---------------------------------------------------------------------------
+# 6. HTTP API supervisor.
 # ---------------------------------------------------------------------------
 API_PID=""
 start_api() {
@@ -113,6 +133,9 @@ start_api
 
 shutdown() {
   log "shutting down"
+  if [[ -n "${DOTS_EXECUTOR_PID}" ]] && kill -0 "${DOTS_EXECUTOR_PID}" 2>/dev/null; then
+    kill "${DOTS_EXECUTOR_PID}" 2>/dev/null || true
+  fi
   if [[ -n "${API_PID}" ]] && kill -0 "${API_PID}" 2>/dev/null; then
     kill "${API_PID}" 2>/dev/null || true
   fi
@@ -126,6 +149,10 @@ while true; do
   if [[ -z "${API_PID}" ]] || ! kill -0 "${API_PID}" 2>/dev/null; then
     log "api process is not running; restarting"
     start_api
+  fi
+
+  if [[ "${DOT_DOTS_EXECUTOR:-0}" == "1" ]]; then
+    start_dots_executor
   fi
 
   daemon_ok=0

@@ -28,8 +28,8 @@ RUN curl -fsSL https://chatgpt.com/codex/install.sh -o /tmp/codex-install.sh \
   && test -x /opt/codex-seed/packages/standalone/current/bin/codex
 
 WORKDIR /app
-COPY package.json server.js entrypoint.sh ./
-RUN chmod +x /app/entrypoint.sh
+COPY package.json server.js entrypoint.sh dots-executor.sh ./
+RUN chmod +x /app/entrypoint.sh /app/dots-executor.sh
 
 ENV CODEX_HOME=/data/codex \
     HOME=/data \

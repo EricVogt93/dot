@@ -27,6 +27,8 @@ jobs:
         run: node --check docker/server.js
       - name: Check entrypoint syntax
         run: bash -n docker/entrypoint.sh
+      - name: Check Dots executor syntax
+        run: bash -n docker/dots-executor.sh
 
   image:
     needs: verify

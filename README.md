@@ -223,6 +223,9 @@ stays in `connecting`/`errored`.
 | `DOT_SANDBOX` | `danger-full-access` | App-server sandbox mode inside container |
 | `DOT_APPROVAL_POLICY` | `never` | App-server approval policy |
 | `DOT_THREAD_MODE` | `persistent` | `persistent` or `ephemeral` threads |
+| `DOT_DOTS_EXECUTOR` | `0` | Enable the Dots/Work local computer connector |
+| `DOT_DOTS_NAME` | hostname | Display name in the Dot's Computers list |
+| `DOT_DOTS_ATTACH` | `1` | Auto-attach to the primary Dot TBO |
 | `DOT_API_KEY` | empty | Bearer token required by the API |
 | `DOT_TURN_TIMEOUT_MS` | `600000` | Per-turn timeout |
 
@@ -258,6 +261,39 @@ sandbox. Treat it as a remote-code-execution endpoint:
 - **GUI does not show the device.** Confirm the environment is `online` in
   `GET /v1/remote/environments`; the GUI reads the same backend record.
   Re-pair a controller with `/v1/remote/pair` if needed.
+
+## Dots local computer connector
+
+Set `DOT_DOTS_EXECUTOR=1` to let ChatGPT Dots/Work use this container as a
+local computer (separate from Codex remote control). The entrypoint then runs
+`/app/dots-executor.sh`, which:
+
+1. registers a local Work executor at
+   `POST https://chatgpt.com/backend-api/flora/cca/executor`;
+2. starts `codex exec-server --remote https://codex-cloud-environments.chatgpt.com/api`
+   and keeps it alive;
+3. attaches the executor to the primary Dot TBO via
+   `/tbo/{tbo}/computers/{env}/connect-and-replace`.
+
+The stable installation id lives in
+`/data/codex/.tpp-local-executor-installation-id`; the executor id is cached in
+`/data/codex/.dots-executor-environment-id`. Logs go to
+`/data/codex/dots-executor.log` and `/data/codex/dots-exec-server.log`.
+
+Useful env vars:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DOT_DOTS_EXECUTOR` | `0` | `1` enables the connector |
+| `DOT_DOTS_NAME` | container hostname | Display name in the Dot's Computers list |
+| `DOT_DOTS_ATTACH` | `1` | Attach to the primary Dot TBO automatically |
+| `DOT_DOTS_TBO_THREAD_ID` | auto (`/tbo/primary`) | Explicit Dot thread id |
+| `DOT_DOTS_TBO_ID` | auto (`/tbo/by-thread`) | Explicit TBO id |
+| `DOT_DOTS_POLL_SECONDS` | `60` | Attachment re-check interval |
+| `DOT_DOTS_REMOTE_URL` | production registry | Executor rendezvous API |
+
+This connector grants the Dot access to `/workspace` and the container; enable
+it only for sandboxes that should be visible as a Dot computer.
 
 ## Kubernetes (k3s)
 
