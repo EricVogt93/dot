@@ -1,18 +1,23 @@
 #!/usr/bin/env node
 /**
- * Dot container API.
+ * Dot container HTTP bridge.
  *
- * Bridges HTTP/OpenAI-style chat requests to one long-lived Codex app-server
- * child process (newline-delimited JSON-RPC over stdio) and exposes the
- * remote-control pairing/device information used by the ChatGPT GUI.
+ * Translates OpenAI-compatible chat requests into turns on a long-lived
+ * `codex app-server` child process (newline-delimited JSON-RPC 2.0 over stdio)
+ * and exposes remote-control pairing and environment status.
  *
  * Zero npm dependencies.
  */
 import { spawn } from "node:child_process";
-import { createServer } from "node:http";
-import { readFile } from "node:fs/promises";
 import { randomUUID, timingSafeEqual } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import { createServer } from "node:http";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
+
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
 
 const CODEX_BIN =
   process.env.CODEX_BIN ||
@@ -27,13 +32,54 @@ const SANDBOX = process.env.DOT_SANDBOX || "danger-full-access";
 const APPROVAL_POLICY = process.env.DOT_APPROVAL_POLICY || "never";
 const THREAD_MODE =
   process.env.DOT_THREAD_MODE === "ephemeral" ? "ephemeral" : "persistent";
-const TURN_TIMEOUT_MS = Number(process.env.DOT_TURN_TIMEOUT_MS || 600000);
+const TURN_TIMEOUT_MS = Number(process.env.DOT_TURN_TIMEOUT_MS || 600_000);
+const CHATGPT_BASE_URL = (
+  process.env.DOT_CHATGPT_BASE_URL || "https://chatgpt.com/backend-api"
+).replace(/\/+$/, "");
+
+// Comma-separated browser origins allowed to call the API (CORS). Empty means
+// no cross-origin access; "*" allows any origin and requires DOT_API_KEY.
+const CORS_ORIGINS = String(process.env.DOT_CORS_ORIGINS || "")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
+// Opt-in: pass --analytics-default-enabled to the app-server.
+const ANALYTICS = process.env.DOT_ANALYTICS === "1";
+
 const MAX_BODY_BYTES = 1024 * 1024;
+const MAX_CMD_OUTPUT_BYTES = 256 * 1024;
+const MAX_RPC_BUFFER_BYTES = 16 * 1024 * 1024;
+const MAX_CONVERSATIONS = 1000;
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]", "::1"]);
+
+const PACKAGE_VERSION = await readFile(
+  new URL("./package.json", import.meta.url),
+  "utf8",
+)
+  .then((raw) => JSON.parse(raw).version || "0.0.0")
+  .catch(() => "0.0.0");
+
+// ---------------------------------------------------------------------------
+// Small utilities & HTTP helpers
+// ---------------------------------------------------------------------------
 
 function log(message, extra) {
   const line = `[dot-api] ${new Date().toISOString()} ${message}`;
   if (extra === undefined) console.log(line);
   else console.log(line, extra);
+}
+
+function httpError(statusCode, message) {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  return error;
+}
+
+function errorMessage(error, fallback = "internal error") {
+  if (!error) return fallback;
+  if (typeof error === "string") return error;
+  return String(error.message || error);
 }
 
 function sendJson(res, status, body) {
@@ -53,62 +99,120 @@ function safeEqual(a, b) {
   return timingSafeEqual(left, right);
 }
 
-function authorized(req, url) {
-  if (!API_KEY) return true;
+function authorized(req, url, apiKey = API_KEY) {
+  if (!apiKey) return true;
   if (url.pathname === "/health") return true;
   const header = req.headers.authorization || "";
   const match = /^Bearer\s+(.+)$/i.exec(header);
-  return Boolean(match && safeEqual(match[1], API_KEY));
+  return Boolean(match && safeEqual(match[1], apiKey));
+}
+
+/**
+ * Without an API key the bridge relies on being reachable only from loopback.
+ * Reject non-loopback Host headers in that mode to block DNS-rebinding attacks
+ * from web pages opened on the same machine.
+ */
+function hostAllowed(req, apiKey = API_KEY) {
+  if (apiKey) return true;
+  const host = String(req.headers.host || "").trim();
+  if (!host) return false;
+  if (host.startsWith("[")) {
+    const end = host.indexOf("]");
+    if (end < 0) return false;
+    return LOOPBACK_HOSTS.has(host.slice(0, end + 1).toLowerCase());
+  }
+  const [name] = host.split(":");
+  return LOOPBACK_HOSTS.has(name.toLowerCase());
+}
+
+function allowedOrigin(origin, origins = CORS_ORIGINS, apiKey = API_KEY) {
+  if (!origin) return null;
+  if (origins.includes("*") && apiKey) return "*";
+  return origins.includes(origin) ? origin : null;
+}
+
+function isJsonRequest(req) {
+  const type = String(req.headers["content-type"] || "").toLowerCase();
+  return type.split(";")[0].trim() === "application/json";
 }
 
 async function readJsonBody(req) {
+  const declaredLength = Number(req.headers["content-length"] || 0);
+  if (declaredLength > MAX_BODY_BYTES) {
+    throw httpError(413, "Request body too large");
+  }
+  const hasBody =
+    declaredLength > 0 || Boolean(req.headers["transfer-encoding"]);
+  if (hasBody && !isJsonRequest(req)) {
+    throw httpError(415, "Content-Type must be application/json");
+  }
+
   const chunks = [];
   let size = 0;
   for await (const chunk of req) {
     size += chunk.length;
     if (size > MAX_BODY_BYTES) {
-      const error = new Error("Request body too large");
-      error.statusCode = 413;
-      throw error;
+      req.destroy();
+      throw httpError(413, "Request body too large");
     }
     chunks.push(chunk);
   }
   if (chunks.length === 0) return {};
+  if (!isJsonRequest(req)) {
+    throw httpError(415, "Content-Type must be application/json");
+  }
   try {
-    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
-  } catch {
-    const error = new Error("Request body is not valid JSON");
-    error.statusCode = 400;
-    throw error;
+    const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw httpError(400, "Request body must be a JSON object");
+    }
+    return parsed;
+  } catch (error) {
+    if (error.statusCode) throw error;
+    throw httpError(400, "Request body is not valid JSON");
   }
 }
 
-function runCodex(args, timeoutMs = 15000) {
+// ---------------------------------------------------------------------------
+// Codex CLI & App-Server JSON-RPC client
+// ---------------------------------------------------------------------------
+
+function runCodex(args, timeoutMs = 15_000) {
   return new Promise((resolve, reject) => {
     const child = spawn(CODEX_BIN, args, {
       env: { ...process.env, CODEX_HOME },
       stdio: ["ignore", "pipe", "pipe"],
     });
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+
     let stdout = "";
     let stderr = "";
     const timer = setTimeout(() => {
       child.kill("SIGKILL");
       reject(new Error(`codex ${args.join(" ")} timed out`));
     }, timeoutMs);
-    child.stdout.on("data", (d) => (stdout += d.toString()));
-    child.stderr.on("data", (d) => (stderr += d.toString()));
+
+    child.stdout.on("data", (chunk) => {
+      if (stdout.length < MAX_CMD_OUTPUT_BYTES) {
+        stdout += chunk.slice(0, MAX_CMD_OUTPUT_BYTES - stdout.length);
+      }
+    });
+    child.stderr.on("data", (chunk) => {
+      if (stderr.length < MAX_CMD_OUTPUT_BYTES) {
+        stderr += chunk.slice(0, MAX_CMD_OUTPUT_BYTES - stderr.length);
+      }
+    });
     child.on("error", (error) => {
       clearTimeout(timer);
+      child.kill("SIGKILL");
       reject(error);
     });
     child.on("close", (code) => {
       clearTimeout(timer);
       if (code !== 0) {
-        reject(
-          new Error(
-            `codex ${args.join(" ")} exited ${code}: ${stderr.trim() || stdout.trim()}`,
-          ),
-        );
+        const detail = stderr.trim() || stdout.trim();
+        reject(new Error(`codex ${args.join(" ")} exited ${code}: ${detail}`));
         return;
       }
       resolve({ stdout, stderr });
@@ -117,7 +221,10 @@ function runCodex(args, timeoutMs = 15000) {
 }
 
 function parseLastJson(text) {
-  const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const lines = String(text)
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
   for (let i = lines.length - 1; i >= 0; i -= 1) {
     try {
       return JSON.parse(lines[i]);
@@ -129,21 +236,22 @@ function parseLastJson(text) {
 }
 
 class AppServer {
-  constructor() {
+  constructor({ onReset } = {}) {
+    this.onReset = onReset || (() => {});
     this.child = null;
+    this.initialized = false;
     this.buffer = "";
     this.nextId = 1;
     this.pending = new Map();
     this.listeners = new Map();
     this.starting = null;
-    this.initialized = false;
     this.shuttingDown = false;
     this.restartDelay = 1000;
     this.restartTimer = null;
   }
 
   async start() {
-    if (this.child) return;
+    if (this.child && this.initialized) return;
     if (this.starting) return this.starting;
     this.starting = this._spawnAndInitialize().finally(() => {
       this.starting = null;
@@ -152,70 +260,91 @@ class AppServer {
   }
 
   async _spawnAndInitialize() {
-    const child = spawn(
-      CODEX_BIN,
-      ["app-server", "--listen", "stdio://", "--analytics-default-enabled"],
-      {
-        env: { ...process.env, CODEX_HOME },
-        stdio: ["pipe", "pipe", "pipe"],
-      },
-    );
+    const args = [
+      "app-server",
+      "--listen",
+      "stdio://",
+      ...(ANALYTICS ? ["--analytics-default-enabled"] : []),
+    ];
+    const child = spawn(CODEX_BIN, args, {
+      env: { ...process.env, CODEX_HOME },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+
     this.child = child;
     this.initialized = false;
     this.buffer = "";
 
-    child.stdout.on("data", (data) => this._onData(data));
-    child.stderr.on("data", (data) => {
-      const text = data.toString().trim();
+    child.stdout.on("data", (chunk) => this._onData(chunk));
+    child.stderr.on("data", (chunk) => {
+      const text = chunk.trim();
       if (text) log(`app-server stderr: ${text.slice(-2000)}`);
     });
-    child.on("error", (error) => log(`app-server spawn error: ${error.message}`));
+    child.on("error", (error) => {
+      log(`app-server spawn error: ${error.message}`);
+    });
     child.on("exit", (code, signal) => {
       log(`app-server exited code=${code} signal=${signal}`);
-      this.child = null;
-      this.initialized = false;
+      if (this.child === child) {
+        this.child = null;
+        this.initialized = false;
+        this.buffer = "";
+      }
       for (const { reject, timer } of this.pending.values()) {
         clearTimeout(timer);
         reject(new Error("app-server exited"));
       }
       this.pending.clear();
+      this.onReset();
+      this._emit("server/exited", { code, signal });
       this._scheduleRestart();
     });
 
-    const response = await this.request(
-      "initialize",
-      {
-        clientInfo: {
-          name: "dot-container",
-          title: "Dot Container",
-          version: "1.0.0",
+    try {
+      const response = await this.request(
+        "initialize",
+        {
+          clientInfo: {
+            name: "dot-container",
+            title: "Dot Container",
+            version: PACKAGE_VERSION,
+          },
+          capabilities: {
+            experimentalApi: false,
+            requestAttestation: false,
+          },
         },
-        capabilities: {
-          experimentalApi: false,
-          requestAttestation: false,
-        },
-      },
-      30000,
-      true,
-    );
-    this._send({ jsonrpc: "2.0", method: "initialized", params: {} });
-    this.initialized = true;
-    this.restartDelay = 1000;
-    // Thread ids belong to the previous process; force recreation after a
-    // crash or restart.
-    conversations.clear();
-    activeTurns.clear();
-    log(`app-server initialized: ${response.userAgent}`);
+        30_000,
+        true,
+      );
+      this._send({ jsonrpc: "2.0", method: "initialized", params: {} });
+      this.initialized = true;
+      this.restartDelay = 1000;
+      this.onReset();
+      log(`app-server initialized: ${response.userAgent}`);
+    } catch (error) {
+      if (this.child === child) {
+        this.child = null;
+        this.initialized = false;
+        this.buffer = "";
+      }
+      child.kill("SIGKILL");
+      throw error;
+    }
   }
 
   _scheduleRestart() {
     if (this.shuttingDown || this.restartTimer) return;
     const delay = this.restartDelay;
-    this.restartDelay = Math.min(this.restartDelay * 2, 30000);
+    this.restartDelay = Math.min(this.restartDelay * 2, 30_000);
     log(`restarting app-server in ${delay}ms`);
     this.restartTimer = setTimeout(() => {
       this.restartTimer = null;
-      this.start().catch((error) => log(`app-server restart failed: ${error.message}`));
+      this.start().catch((error) => {
+        log(`app-server restart failed: ${error.message}`);
+      });
     }, delay);
   }
 
@@ -227,14 +356,24 @@ class AppServer {
     child.stdin.write(`${JSON.stringify(message)}\n`);
   }
 
-  _onData(data) {
-    this.buffer += data.toString();
-    let index = this.buffer.indexOf("\n");
+  _onData(chunk) {
+    this.buffer += chunk;
+    let start = 0;
+    let index = this.buffer.indexOf("\n", start);
     while (index >= 0) {
-      const line = this.buffer.slice(0, index).trim();
-      this.buffer = this.buffer.slice(index + 1);
+      const line = this.buffer.slice(start, index).trim();
+      start = index + 1;
       if (line) this._onLine(line);
-      index = this.buffer.indexOf("\n");
+      index = this.buffer.indexOf("\n", start);
+    }
+    if (start > 0) {
+      this.buffer = this.buffer.slice(start);
+    }
+    if (this.buffer.length > MAX_RPC_BUFFER_BYTES) {
+      log(
+        `dropping oversized app-server line (${this.buffer.length} bytes > ${MAX_RPC_BUFFER_BYTES})`,
+      );
+      this.buffer = "";
     }
   }
 
@@ -270,42 +409,51 @@ class AppServer {
     }
 
     if (message.method) {
-      const handlers = this.listeners.get(message.method);
-      if (handlers) {
-        for (const handler of handlers) {
-          try {
-            handler(message.params || {});
-          } catch (error) {
-            log(`notification handler failed: ${error.message}`);
-          }
-        }
+      this._emit(message.method, message.params || {});
+    }
+  }
+
+  _emit(method, params) {
+    const handlers = this.listeners.get(method);
+    if (!handlers) return;
+    for (const handler of handlers) {
+      try {
+        handler(params);
+      } catch (error) {
+        log(`notification handler for ${method} failed: ${error.message}`);
       }
     }
   }
 
   _replyToServerRequest(message) {
-    const method = message.method;
-    let result = null;
+    const { id, method } = message;
+    let response;
     if (
       method === "execCommandApproval" ||
       method === "applyPatchApproval"
     ) {
-      result = { decision: "approved" };
+      response = { jsonrpc: "2.0", id, result: { decision: "approved" } };
     } else if (method === "fileChangeRequestApproval") {
-      result = { decision: "accept" };
+      response = { jsonrpc: "2.0", id, result: { decision: "accept" } };
+    } else if (method === "toolRequestUserInput") {
+      response = { jsonrpc: "2.0", id, result: { answers: {} } };
     } else if (method === "permissionsRequestApproval") {
       // The container grants the sandbox it was started with; deny ad-hoc
       // permission escalations instead of silently widening it.
-      result = { error: { code: -32601, message: "permission escalation unsupported" } };
-    } else if (method === "toolRequestUserInput") {
-      result = { answers: {} };
+      response = {
+        jsonrpc: "2.0",
+        id,
+        error: { code: -32601, message: "permission escalation unsupported" },
+      };
     } else {
-      result = {
+      response = {
+        jsonrpc: "2.0",
+        id,
         error: { code: -32601, message: `unsupported server request: ${method}` },
       };
     }
     try {
-      this._send({ jsonrpc: "2.0", id: message.id, result });
+      this._send(response);
     } catch (error) {
       log(`failed replying to ${method}: ${error.message}`);
     }
@@ -318,10 +466,13 @@ class AppServer {
       this.listeners.set(method, set);
     }
     set.add(handler);
-    return () => set.delete(handler);
+    return () => {
+      set.delete(handler);
+      if (set.size === 0) this.listeners.delete(method);
+    };
   }
 
-  async request(method, params, timeoutMs = 30000, allowBeforeInit = false) {
+  async request(method, params, timeoutMs = 30_000, allowBeforeInit = false) {
     if (!allowBeforeInit) {
       await this.start();
     }
@@ -346,35 +497,47 @@ class AppServer {
     this.shuttingDown = true;
     clearTimeout(this.restartTimer);
     const child = this.child;
-    if (child) {
-      child.stdin.end();
-      child.kill("SIGTERM");
-      await new Promise((resolve) => {
-        const timer = setTimeout(() => {
-          child.kill("SIGKILL");
-          resolve();
-        }, 3000);
-        child.once("exit", () => {
-          clearTimeout(timer);
-          resolve();
-        });
+    if (!child) return;
+    child.stdin.end();
+    child.kill("SIGTERM");
+    await new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        child.kill("SIGKILL");
+        resolve();
+      }, 3000);
+      child.once("exit", () => {
+        clearTimeout(timer);
+        resolve();
       });
-    }
+    });
   }
 }
 
-const appServer = new AppServer();
+// ---------------------------------------------------------------------------
+// Conversation & Turn management
+// ---------------------------------------------------------------------------
+
 const conversations = new Map(); // conversationId -> {threadId, developerInstructions, model, queue}
+const pendingThreads = new Map(); // conversationId -> Promise<entry>
 const activeTurns = new Map(); // threadId -> turnId
+
+const appServer = new AppServer({
+  onReset() {
+    conversations.clear();
+    pendingThreads.clear();
+    activeTurns.clear();
+  },
+});
 
 function validateCwd(requested) {
   if (!requested) return WORKSPACE;
-  const resolved = path.resolve(String(requested));
+  if (typeof requested !== "string" || requested.includes("\0")) {
+    throw httpError(400, "cwd must be a valid path string");
+  }
+  const resolved = path.resolve(requested);
   const root = WORKSPACE.endsWith(path.sep) ? WORKSPACE : WORKSPACE + path.sep;
   if (resolved !== WORKSPACE && !resolved.startsWith(root)) {
-    const error = new Error(`cwd must be inside ${WORKSPACE}`);
-    error.statusCode = 400;
-    throw error;
+    throw httpError(400, `cwd must be inside ${WORKSPACE}`);
   }
   return resolved;
 }
@@ -384,15 +547,12 @@ function contentToText(content) {
   if (Array.isArray(content)) {
     const parts = [];
     for (const part of content) {
-      if (typeof part === "string") parts.push(part);
-      else if (part && part.type === "text" && typeof part.text === "string") {
+      if (typeof part === "string") {
+        parts.push(part);
+      } else if (part && part.type === "text" && typeof part.text === "string") {
         parts.push(part.text);
       } else {
-        const error = new Error(
-          "Only text content parts are supported by this bridge",
-        );
-        error.statusCode = 400;
-        throw error;
+        throw httpError(400, "Only text content parts are supported by this bridge");
       }
     }
     return parts.join("\n");
@@ -413,9 +573,7 @@ function normalizeMessages(body) {
   if (!lastUser && typeof body.input === "string") lastUser = body.input;
   if (!lastUser && typeof body.prompt === "string") lastUser = body.prompt;
   if (!lastUser) {
-    const error = new Error("at least one user message is required");
-    error.statusCode = 400;
-    throw error;
+    throw httpError(400, "at least one user message is required");
   }
   return { system: system.filter(Boolean).join("\n\n"), lastUser };
 }
@@ -430,11 +588,17 @@ function conversationIdFor(body, req) {
   );
 }
 
-async function getThread(conversationId, body) {
-  let entry = conversations.get(conversationId);
-  if (entry && entry.threadId) return entry;
+function evictOldestConversations() {
+  if (conversations.size < MAX_CONVERSATIONS) return;
+  for (const [key, entry] of conversations) {
+    if (conversations.size < MAX_CONVERSATIONS) break;
+    if (activeTurns.has(entry.threadId)) continue;
+    conversations.delete(key);
+  }
+}
 
-  const { system, lastUser } = normalizeMessages(body);
+async function createThread(conversationId, body) {
+  const { system } = normalizeMessages(body);
   const cwd = validateCwd(body.cwd);
   const params = {
     cwd,
@@ -446,25 +610,51 @@ async function getThread(conversationId, body) {
   if (model) params.model = model;
   if (system) params.developerInstructions = system;
 
-  const response = await appServer.request("thread/start", params, 60000);
-  const threadId = response && response.thread && response.thread.id;
+  const response = await appServer.request("thread/start", params, 60_000);
+  const threadId = response?.thread?.id;
   if (!threadId) throw new Error("thread/start returned no thread id");
-  entry = {
+
+  const entry = {
     threadId,
     developerInstructions: system,
     model: model || null,
     queue: Promise.resolve(),
   };
-  conversations.set(conversationId, entry);
+  if (THREAD_MODE !== "ephemeral") {
+    evictOldestConversations();
+    conversations.set(conversationId, entry);
+  }
   log(`created thread ${threadId} for conversation ${conversationId}`);
   return entry;
 }
 
-function runTurn(entry, body, onDelta, signal) {
+async function getThread(conversationId, body) {
+  if (THREAD_MODE === "ephemeral") {
+    return createThread(conversationId, body);
+  }
+  const existing = conversations.get(conversationId);
+  if (existing) {
+    // Refresh insertion order for LRU eviction.
+    conversations.delete(conversationId);
+    conversations.set(conversationId, existing);
+    return existing;
+  }
+  const inflight = pendingThreads.get(conversationId);
+  if (inflight) return inflight;
+
+  const promise = createThread(conversationId, body).finally(() => {
+    pendingThreads.delete(conversationId);
+  });
+  pendingThreads.set(conversationId, promise);
+  return promise;
+}
+
+function runTurn(entry, body, onDelta, signal, { accumulateText = true } = {}) {
+  const { lastUser } = normalizeMessages(body);
   const run = async () => {
-    const { lastUser } = normalizeMessages(body);
     let turnId = null;
     let delivered = "";
+    let hasDelivered = false;
     let finished = false;
     let aborted = false;
     let timer = null;
@@ -473,70 +663,71 @@ function runTurn(entry, body, onDelta, signal) {
       resolveFinish = resolve;
     });
 
-    let offDelta = () => {};
-    let offCompleted = () => {};
-    let offError = () => {};
-
-    function cleanup() {
+    const unsubscribers = [];
+    const cleanup = () => {
       clearTimeout(timer);
-      offDelta();
-      offCompleted();
-      offError();
+      for (const off of unsubscribers) off();
+      unsubscribers.length = 0;
       if (signal) signal.removeEventListener("abort", onAbort);
       if (turnId && activeTurns.get(entry.threadId) === turnId) {
         activeTurns.delete(entry.threadId);
       }
-    }
+    };
 
-    function done(error) {
+    const done = (error) => {
       if (finished) return;
       finished = true;
       cleanup();
       resolveFinish({ error: error || null });
-    }
+    };
 
     function onAbort() {
       aborted = true;
       if (!turnId) return; // interrupt after turn/start returns
       appServer
-        .request("turn/interrupt", { threadId: entry.threadId, turnId }, 10000)
+        .request("turn/interrupt", { threadId: entry.threadId, turnId }, 10_000)
         .catch(() => {});
       done(new Error("client disconnected"));
     }
 
-    // Listen before turn/start: a fast turn can complete before the RPC
-    // response is read.
-    offDelta = appServer.on("item/agentMessage/delta", (params) => {
-      if (params.threadId !== entry.threadId) return;
-      if (turnId && params.turnId && params.turnId !== turnId) return;
-      if (typeof params.delta === "string") {
-        delivered += params.delta;
-        onDelta(params.delta);
-      }
-    });
-    offCompleted = appServer.on("turn/completed", (params) => {
-      if (params.threadId !== entry.threadId) return;
-      const completed = params.turn || {};
-      if (turnId && completed.id && completed.id !== turnId) return;
-      if (!turnId && completed.id) turnId = completed.id;
-      if (!completed.error && !delivered) {
-        const items = Array.isArray(completed.items) ? completed.items : [];
-        for (const item of items) {
-          if (item && item.type === "agentMessage" && item.text) {
-            delivered += item.text;
-            onDelta(item.text);
+    // Subscribe before turn/start: a fast turn can complete before the RPC
+    // response is processed.
+    unsubscribers.push(
+      appServer.on("item/agentMessage/delta", (params) => {
+        if (params.threadId !== entry.threadId) return;
+        if (turnId && params.turnId && params.turnId !== turnId) return;
+        if (typeof params.delta === "string") {
+          hasDelivered = true;
+          if (accumulateText) delivered += params.delta;
+          onDelta(params.delta);
+        }
+      }),
+      appServer.on("turn/completed", (params) => {
+        if (params.threadId !== entry.threadId) return;
+        const completed = params.turn || {};
+        if (turnId && completed.id && completed.id !== turnId) return;
+        if (!turnId && completed.id) turnId = completed.id;
+        if (!completed.error && !hasDelivered) {
+          const items = Array.isArray(completed.items) ? completed.items : [];
+          for (const item of items) {
+            if (item && item.type === "agentMessage" && item.text) {
+              hasDelivered = true;
+              if (accumulateText) delivered += item.text;
+              onDelta(item.text);
+            }
           }
         }
-      }
-      done(completed.error || null);
-    });
-    offError = appServer.on("error", (params) => {
-      done(
-        new Error(
-          (params && (params.message || params.error)) || "turn failed",
-        ),
-      );
-    });
+        done(completed.error || null);
+      }),
+      appServer.on("error", (params) => {
+        if (params?.threadId && params.threadId !== entry.threadId) return;
+        if (turnId && params?.turnId && params.turnId !== turnId) return;
+        done(new Error(params?.message || params?.error || "turn failed"));
+      }),
+      appServer.on("server/exited", () => {
+        done(new Error("app-server exited during turn"));
+      }),
+    );
 
     if (signal) signal.addEventListener("abort", onAbort, { once: true });
 
@@ -548,14 +739,14 @@ function runTurn(entry, body, onDelta, signal) {
           threadId: entry.threadId,
           input: [{ type: "text", text: lastUser }],
         },
-        60000,
+        60_000,
       );
     } catch (error) {
       done(error);
       throw error;
     }
 
-    const startedTurnId = response && response.turn && response.turn.id;
+    const startedTurnId = response?.turn?.id;
     if (!turnId) turnId = startedTurnId || null;
     if (!finished) {
       if (turnId) activeTurns.set(entry.threadId, turnId);
@@ -564,7 +755,7 @@ function runTurn(entry, body, onDelta, signal) {
           .request(
             "turn/interrupt",
             { threadId: entry.threadId, turnId },
-            10000,
+            10_000,
           )
           .catch(() => {});
         done(new Error(`turn timed out after ${TURN_TIMEOUT_MS}ms`));
@@ -578,91 +769,27 @@ function runTurn(entry, body, onDelta, signal) {
     return { turnId, error: result.error, text: delivered };
   };
 
-  // Serialize turns for the same thread; the app-server does not allow
-  // concurrent turns on one thread.
+  // Serialize turns for the same thread; discard resolved payload on entry.queue
+  // so idle conversations do not retain the previous turn's response text.
   const queued = entry.queue.then(run, run);
-  entry.queue = queued.catch(() => {});
+  entry.queue = queued.then(
+    () => undefined,
+    () => undefined,
+  );
   return queued;
 }
 
-async function handleChatCompletions(req, res, body) {
-  const conversationId = conversationIdFor(body, req);
-  const entry = await getThread(conversationId, body);
-  const model = body.model || entry.model || MODEL || "codex";
-  const id = `chatcmpl-${randomUUID()}`;
-  const created = Math.floor(Date.now() / 1000);
+// ---------------------------------------------------------------------------
+// State readers
+// ---------------------------------------------------------------------------
 
-  if (body.stream === true) {
-    res.writeHead(200, {
-      "Content-Type": "text/event-stream; charset=utf-8",
-      "Cache-Control": "no-cache, no-transform",
-      Connection: "keep-alive",
-      "X-Accel-Buffering": "no",
-    });
-    const write = (payload) => {
-      if (!res.writableEnded) res.write(`data: ${JSON.stringify(payload)}\n\n`);
-    };
-    const chunk = (delta, finishReason = null) => ({
-      id,
-      object: "chat.completion.chunk",
-      created,
-      model,
-      choices: [{ index: 0, delta, finish_reason: finishReason }],
-    });
-
-    write(chunk({ role: "assistant", content: "" }));
-    const ping = setInterval(() => {
-      if (!res.writableEnded) res.write(": ping\n\n");
-    }, 15000);
-    const controller = new AbortController();
-    req.on("close", () => controller.abort());
-
-    try {
-      const result = await runTurn(
-        entry,
-        body,
-        (delta) => write(chunk({ content: delta })),
-        controller.signal,
-      );
-      if (result.error) {
-        write({ error: { message: String(result.error.message || result.error) } });
-      } else {
-        write(chunk({}, "stop"));
-      }
-    } catch (error) {
-      write({ error: { message: error.message } });
-    } finally {
-      clearInterval(ping);
-      if (!res.writableEnded) {
-        res.write("data: [DONE]\n\n");
-        res.end();
-      }
-    }
-    return;
+async function readInstallationId() {
+  try {
+    const raw = await readFile(path.join(CODEX_HOME, "installation_id"), "utf8");
+    return raw.trim() || null;
+  } catch {
+    return null;
   }
-
-  const result = await runTurn(entry, body, () => {});
-  if (result.error) {
-    const error = new Error(String(result.error.message || result.error));
-    error.statusCode = 502;
-    throw error;
-  }
-  sendJson(res, 200, {
-    id,
-    object: "chat.completion",
-    created,
-    model,
-    choices: [
-      {
-        index: 0,
-        message: { role: "assistant", content: result.text },
-        finish_reason: "stop",
-      },
-    ],
-    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-    conversation_id: conversationId,
-    thread_id: entry.threadId,
-  });
 }
 
 async function readAuth() {
@@ -708,7 +835,8 @@ async function readRemoteStatus() {
     const { stdout } = await runCodex(["app-server", "daemon", "version"], 5000);
     const data = JSON.parse(stdout.trim());
     return {
-      connected: data.status === "running" && data.appServerVersion === data.cliVersion,
+      connected:
+        data.status === "running" && data.appServerVersion === data.cliVersion,
       status: data.status === "running" ? "running" : data.status || "unknown",
       serverName: null,
       environmentId: null,
@@ -729,27 +857,123 @@ async function codexVersion() {
   if (cachedVersion) return cachedVersion;
   try {
     const { stdout } = await runCodex(["--version"], 5000);
-    cachedVersion = stdout.trim() || "unknown";
+    const version = stdout.trim();
+    if (version) {
+      cachedVersion = version;
+      return version;
+    }
+    return "unknown";
   } catch {
-    cachedVersion = "unavailable";
+    return "unavailable";
   }
-  return cachedVersion;
+}
+
+// ---------------------------------------------------------------------------
+// Route handlers
+// ---------------------------------------------------------------------------
+
+async function handleChatCompletions(req, res, body) {
+  const conversationId = conversationIdFor(body, req);
+  const entry = await getThread(conversationId, body);
+  const model = body.model || entry.model || MODEL || "codex";
+  const id = `chatcmpl-${randomUUID()}`;
+  const created = Math.floor(Date.now() / 1000);
+
+  if (body.stream === true) {
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
+    });
+    const write = (payload) => {
+      if (!res.writableEnded) res.write(`data: ${JSON.stringify(payload)}\n\n`);
+    };
+    const chunk = (delta, finishReason = null) => ({
+      id,
+      object: "chat.completion.chunk",
+      created,
+      model,
+      choices: [{ index: 0, delta, finish_reason: finishReason }],
+    });
+
+    write(chunk({ role: "assistant", content: "" }));
+    const ping = setInterval(() => {
+      if (!res.writableEnded) res.write(": ping\n\n");
+    }, 15_000);
+    const controller = new AbortController();
+    const onClose = () => controller.abort();
+    res.on("close", onClose);
+
+    try {
+      const result = await runTurn(
+        entry,
+        body,
+        (delta) => write(chunk({ content: delta })),
+        controller.signal,
+        { accumulateText: false },
+      );
+      if (result.error) {
+        write({ error: { message: errorMessage(result.error) } });
+      } else {
+        write(chunk({}, "stop"));
+      }
+    } catch (error) {
+      write({ error: { message: errorMessage(error) } });
+    } finally {
+      clearInterval(ping);
+      res.off("close", onClose);
+      if (!res.writableEnded) {
+        res.write("data: [DONE]\n\n");
+        res.end();
+      }
+    }
+    return;
+  }
+
+  const result = await runTurn(entry, body, () => {});
+  if (result.error) {
+    throw httpError(502, errorMessage(result.error));
+  }
+  sendJson(res, 200, {
+    id,
+    object: "chat.completion",
+    created,
+    model,
+    choices: [
+      {
+        index: 0,
+        message: { role: "assistant", content: result.text },
+        finish_reason: "stop",
+      },
+    ],
+    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    conversation_id: conversationId,
+    thread_id: entry.threadId,
+  });
+}
+
+async function handleSimpleChat(req, res, body) {
+  const conversationId = conversationIdFor(body, req);
+  const entry = await getThread(conversationId, body);
+  const result = await runTurn(entry, body, () => {});
+  if (result.error) {
+    throw httpError(502, errorMessage(result.error));
+  }
+  sendJson(res, 200, {
+    reply: result.text,
+    thread_id: entry.threadId,
+    conversation_id: conversationId,
+  });
 }
 
 async function handleHealth(req, res) {
-  const [auth, remote, version] = await Promise.all([
+  const [auth, remote, version, installationId] = await Promise.all([
     readAuth(),
     readRemoteStatus(),
     codexVersion(),
+    readInstallationId(),
   ]);
-  let installationId = null;
-  try {
-    installationId = (
-      await readFile(path.join(CODEX_HOME, "installation_id"), "utf8")
-    ).trim();
-  } catch {
-    // Optional.
-  }
   sendJson(res, 200, {
     ok: true,
     codex: { version, bin: CODEX_BIN },
@@ -765,30 +989,26 @@ async function handleHealth(req, res) {
 }
 
 async function handleRemoteEnvironments(req, res) {
-  const auth = await readAuth();
+  const [auth, installationId] = await Promise.all([
+    readAuth(),
+    readInstallationId(),
+  ]);
   if (!auth.accessToken) {
     sendJson(res, 401, {
       error: "No ChatGPT access token in auth.json; run device login first.",
     });
     return;
   }
-  let installationId = null;
-  try {
-    installationId = (
-      await readFile(path.join(CODEX_HOME, "installation_id"), "utf8")
-    ).trim();
-  } catch {
-    // Optional.
-  }
   const headers = {
     Authorization: `Bearer ${auth.accessToken}`,
     "User-Agent": "codex-cli/dot-container",
   };
   if (auth.accountId) headers["chatgpt-account-id"] = auth.accountId;
+
   try {
     const response = await fetch(
-      "https://chatgpt.com/backend-api/wham/remote/control/environments",
-      { headers, signal: AbortSignal.timeout(15000) },
+      `${CHATGPT_BASE_URL}/wham/remote/control/environments`,
+      { headers, signal: AbortSignal.timeout(15_000) },
     );
     const text = await response.text();
     if (!response.ok) {
@@ -807,47 +1027,73 @@ async function handleRemoteEnvironments(req, res) {
       ) || null;
     sendJson(res, 200, { self, items });
   } catch (error) {
-    sendJson(res, 502, { error: error.message });
+    sendJson(res, 502, { error: errorMessage(error) });
   }
 }
 
 async function handlePair(req, res) {
   try {
-    const { stdout } = await runCodex(["remote-control", "pair", "--json"], 15000);
+    const { stdout } = await runCodex(
+      ["remote-control", "pair", "--json"],
+      15_000,
+    );
     sendJson(res, 200, parseLastJson(stdout));
   } catch (error) {
-    sendJson(res, 502, { error: error.message });
+    sendJson(res, 502, { error: errorMessage(error) });
   }
 }
 
 async function handleInterrupt(req, res, body) {
   const threadId = body.thread_id || body.threadId;
-  if (!threadId) {
-    sendJson(res, 400, { error: "thread_id is required" });
-    return;
+  if (!threadId || typeof threadId !== "string") {
+    throw httpError(400, "thread_id is required");
   }
   const turnId = activeTurns.get(threadId);
   if (!turnId) {
-    sendJson(res, 404, { error: "no active turn for that thread" });
-    return;
+    throw httpError(404, "no active turn for that thread");
   }
-  await appServer.request("turn/interrupt", { threadId, turnId }, 10000);
+  await appServer.request("turn/interrupt", { threadId, turnId }, 10_000);
   sendJson(res, 200, { ok: true, thread_id: threadId, turn_id: turnId });
 }
 
+// ---------------------------------------------------------------------------
+// HTTP server & lifecycle
+// ---------------------------------------------------------------------------
+
 const server = createServer(async (req, res) => {
-  const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+  const url = new URL(req.url || "/", "http://localhost");
   try {
+    if (!hostAllowed(req)) {
+      sendJson(res, 403, {
+        error:
+          "non-loopback Host header rejected; set DOT_API_KEY to allow remote access",
+      });
+      return;
+    }
+
+    const origin = req.headers.origin;
+    const corsOrigin = allowedOrigin(origin);
+    if (origin && !corsOrigin) {
+      // Browsers attach Origin to cross-site requests. Refuse them unless the
+      // origin is explicitly allowed, so a web page cannot drive the agent.
+      sendJson(res, 403, { error: "origin not allowed" });
+      return;
+    }
+    if (corsOrigin) {
+      res.setHeader("Access-Control-Allow-Origin", corsOrigin);
+      res.setHeader("Vary", "Origin");
+    }
+
     if (req.method === "OPTIONS") {
       res.writeHead(204, {
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Headers": "Authorization, Content-Type",
+        "Access-Control-Allow-Headers":
+          "Authorization, Content-Type, X-Conversation-Id",
         "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
       });
       res.end();
       return;
     }
-    res.setHeader("Access-Control-Allow-Origin", "*");
+
     if (!authorized(req, url)) {
       sendJson(res, 401, { error: "invalid or missing API key" });
       return;
@@ -876,17 +1122,7 @@ const server = createServer(async (req, res) => {
     }
     if (req.method === "POST" && url.pathname === "/v1/chat") {
       const body = await readJsonBody(req);
-      const entry = await getThread(conversationIdFor(body, req), body);
-      const result = await runTurn(entry, body, () => {});
-      if (result.error) {
-        sendJson(res, 502, { error: String(result.error.message || result.error) });
-        return;
-      }
-      sendJson(res, 200, {
-        reply: result.text,
-        thread_id: entry.threadId,
-        conversation_id: conversationIdFor(body, req),
-      });
+      await handleSimpleChat(req, res, body);
       return;
     }
     if (
@@ -896,10 +1132,7 @@ const server = createServer(async (req, res) => {
       await handlePair(req, res);
       return;
     }
-    if (
-      req.method === "GET" &&
-      url.pathname === "/v1/remote/environments"
-    ) {
+    if (req.method === "GET" && url.pathname === "/v1/remote/environments") {
       await handleRemoteEnvironments(req, res);
       return;
     }
@@ -908,19 +1141,18 @@ const server = createServer(async (req, res) => {
       await handleInterrupt(req, res, body);
       return;
     }
+
     sendJson(res, 404, { error: "not found" });
   } catch (error) {
+    if (error.statusCode === 413) {
+      res.setHeader("Connection", "close");
+    }
     if (!res.headersSent) {
-      sendJson(res, error.statusCode || 500, { error: error.message });
+      sendJson(res, error.statusCode || 500, { error: errorMessage(error) });
     } else if (!res.writableEnded) {
       res.end();
     }
   }
-});
-
-server.listen(PORT, BIND, () => {
-  log(`listening on ${BIND}:${PORT} workspace=${WORKSPACE} codex=${CODEX_BIN}`);
-  appServer.start().catch((error) => log(`initial app-server start failed: ${error.message}`));
 });
 
 async function shutdown(signal) {
@@ -929,5 +1161,39 @@ async function shutdown(signal) {
   await appServer.stop();
   process.exit(0);
 }
-process.on("SIGTERM", () => shutdown("SIGTERM"));
-process.on("SIGINT", () => shutdown("SIGINT"));
+
+function start() {
+  if (CORS_ORIGINS.includes("*") && !API_KEY) {
+    log('DOT_CORS_ORIGINS="*" ignored because DOT_API_KEY is not set');
+  }
+  if (!API_KEY && !LOOPBACK_HOSTS.has(BIND)) {
+    log(
+      `WARNING: listening on ${BIND} without DOT_API_KEY; only loopback Host headers are accepted`,
+    );
+  }
+  server.listen(PORT, BIND, () => {
+    log(`listening on ${BIND}:${PORT} workspace=${WORKSPACE} codex=${CODEX_BIN}`);
+    appServer.start().catch((error) => {
+      log(`initial app-server start failed: ${error.message}`);
+    });
+  });
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
+}
+
+const isMain =
+  process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isMain) start();
+
+export {
+  allowedOrigin,
+  authorized,
+  contentToText,
+  conversationIdFor,
+  hostAllowed,
+  normalizeMessages,
+  parseLastJson,
+  server,
+  start,
+  validateCwd,
+};

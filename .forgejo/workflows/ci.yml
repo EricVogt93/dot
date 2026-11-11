@@ -1,5 +1,23 @@
 name: CI
 
+# Forgejo is the primary repository; the GitHub mirror runs no workflows.
+#
+# Configuration (repository settings → Actions):
+#   vars.REGISTRY              container registry host, e.g. registry.example.com
+#                              (unset: the image is built but not pushed)
+#   vars.REGISTRY_USER         registry user
+#   secrets.REGISTRY_TOKEN     registry token/password
+#   vars.DEPLOY_NAMESPACE      namespace of the dot Deployment (deploy job)
+#   secrets.KUBE_CONFIG        kubeconfig for the deploy job
+#   secrets.DEPLOY_KUSTOMIZATION
+#                              kustomization.yaml of a private overlay; written
+#                              to deploy/overlays/ci/ (see README, "Kubernetes")
+#   vars.GITHUB_MIRROR_REPO    target GitHub repository ("owner/repo" or full
+#                              https://github.com/owner/repo.git URL)
+#   secrets.GITHUB_MIRROR_TOKEN
+#                              GitHub token with Contents write permission
+# The deploy and mirror jobs run on main only and are skipped when unset.
+
 on:
   push:
     branches: [main, development]
@@ -9,7 +27,7 @@ permissions:
   contents: read
 
 env:
-  REGISTRY: registry.ericvogt.com
+  REGISTRY: ${{ vars.REGISTRY }}
 
 jobs:
   verify:
@@ -23,18 +41,19 @@ jobs:
         uses: https://data.forgejo.org/actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - name: Check JavaScript syntax
-        run: node --check docker/server.js
-      - name: Check entrypoint syntax
-        run: bash -n docker/entrypoint.sh
-      - name: Check Dots executor syntax
-        run: bash -n docker/dots-executor.sh
+      - name: Syntax checks
+        working-directory: docker
+        run: npm run lint
+      - name: Unit and integration tests
+        working-directory: docker
+        run: npm test
 
   image:
     needs: verify
     runs-on: general
     container:
       image: docker:27-cli
+      # Runner-specific: rootless Podman socket of the runner host.
       options: -v /run/user/1000/podman/podman.sock:/var/run/docker.sock
     env:
       REGISTRY_USER: ${{ vars.REGISTRY_USER }}
@@ -46,29 +65,42 @@ jobs:
         uses: https://data.forgejo.org/actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - name: Resolve image tag
+      - name: Resolve image
         id: image
-        run: echo "short_sha=$(git rev-parse --short=8 HEAD)" >> "$FORGEJO_OUTPUT"
-      - name: Authenticate to registry
+        env:
+          REPOSITORY: ${{ forgejo.repository }}
         run: |
-          : "${REGISTRY_USER:?Forgejo variable REGISTRY_USER is required}"
-          : "${REGISTRY_TOKEN:?Forgejo secret REGISTRY_TOKEN is required}"
-          printf '%s' "$REGISTRY_TOKEN" | docker login "$REGISTRY" --username "$REGISTRY_USER" --password-stdin
+          echo "short_sha=$(git rev-parse --short=8 HEAD)" >> "$FORGEJO_OUTPUT"
+          if [ -n "$REGISTRY" ]; then
+            echo "name=$REGISTRY/$REPOSITORY" >> "$FORGEJO_OUTPUT"
+          else
+            echo "name=$REPOSITORY" >> "$FORGEJO_OUTPUT"
+          fi
       - name: Build image
         env:
-          IMAGE: registry.ericvogt.com/${{ forgejo.repository }}
+          IMAGE: ${{ steps.image.outputs.name }}
           SHORT_SHA: ${{ steps.image.outputs.short_sha }}
+          SOURCE_URL: ${{ forgejo.server_url }}/${{ forgejo.repository }}
         run: |
           docker build --network=host \
+            --build-arg "DOT_SOURCE_URL=$SOURCE_URL" \
             --tag "$IMAGE:$SHORT_SHA" \
             --tag "$IMAGE:latest" \
             docker
       - name: Push image
+        if: forgejo.event_name == 'push'
         env:
-          IMAGE: registry.ericvogt.com/${{ forgejo.repository }}
+          IMAGE: ${{ steps.image.outputs.name }}
           SHORT_SHA: ${{ steps.image.outputs.short_sha }}
           TARGET_REF: ${{ forgejo.ref }}
         run: |
+          if [ -z "$REGISTRY" ]; then
+            echo "vars.REGISTRY is not set; skipping push"
+            exit 0
+          fi
+          : "${REGISTRY_USER:?Forgejo variable REGISTRY_USER is required}"
+          : "${REGISTRY_TOKEN:?Forgejo secret REGISTRY_TOKEN is required}"
+          printf '%s' "$REGISTRY_TOKEN" | docker login "$REGISTRY" --username "$REGISTRY_USER" --password-stdin
           if [ "$TARGET_REF" = "refs/heads/main" ]; then
             docker push "$IMAGE:$SHORT_SHA"
             docker push "$IMAGE:latest"
@@ -81,38 +113,98 @@ jobs:
   deploy:
     needs: image
     runs-on: general
-    if: forgejo.ref == 'refs/heads/main' && success()
+    if: forgejo.event_name == 'push' && forgejo.ref == 'refs/heads/main' && success()
     container:
       image: alpine:3.20
     env:
-      IMAGE: registry.ericvogt.com/${{ forgejo.repository }}
+      IMAGE: ${{ vars.REGISTRY }}/${{ forgejo.repository }}
       FORGEJO_SHA: ${{ forgejo.sha }}
       KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+      DEPLOY_KUSTOMIZATION: ${{ secrets.DEPLOY_KUSTOMIZATION }}
+      DEPLOY_NAMESPACE: ${{ vars.DEPLOY_NAMESPACE }}
     steps:
+      - name: Check deploy configuration
+        id: config
+        run: |
+          if [ -z "$REGISTRY" ] || [ -z "$KUBE_CONFIG" ] || [ -z "$DEPLOY_KUSTOMIZATION" ] || [ -z "$DEPLOY_NAMESPACE" ]; then
+            echo "deploy not configured (REGISTRY, KUBE_CONFIG, DEPLOY_KUSTOMIZATION, DEPLOY_NAMESPACE); skipping"
+            echo "enabled=false" >> "$FORGEJO_OUTPUT"
+          else
+            echo "enabled=true" >> "$FORGEJO_OUTPUT"
+          fi
       - name: Install action runtime
+        if: steps.config.outputs.enabled == 'true'
         run: apk add --no-cache ca-certificates curl git nodejs
       - name: Check out repository
+        if: steps.config.outputs.enabled == 'true'
         uses: https://data.forgejo.org/actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
       - name: Install kubectl
+        if: steps.config.outputs.enabled == 'true'
         run: |
           curl -fsSLo /usr/local/bin/kubectl \
             https://dl.k8s.io/release/v1.35.9/bin/linux/amd64/kubectl
           chmod +x /usr/local/bin/kubectl
-      - name: Write kubeconfig
+      - name: Write kubeconfig and overlay
+        if: steps.config.outputs.enabled == 'true'
         run: |
-          : "${KUBE_CONFIG:?Forgejo secret KUBE_CONFIG is required}"
-          mkdir -p /root/.kube
+          mkdir -p /root/.kube deploy/overlays/ci
           printf '%s' "$KUBE_CONFIG" > /root/.kube/config
           chmod 600 /root/.kube/config
+          printf '%s\n' "$DEPLOY_KUSTOMIZATION" > deploy/overlays/ci/kustomization.yaml
       - name: Apply manifests
-        run: kubectl apply -f deploy/k8s.yaml
+        if: steps.config.outputs.enabled == 'true'
+        run: kubectl apply -k deploy/overlays/ci
       - name: Set deployed image
+        if: steps.config.outputs.enabled == 'true'
         run: |
           SHORT_SHA="$(printf '%s' "$FORGEJO_SHA" | cut -c1-8)"
-          kubectl -n apps set image deployment/dot "dot=$IMAGE:$SHORT_SHA"
+          kubectl -n "$DEPLOY_NAMESPACE" set image deployment/dot "dot=$IMAGE:$SHORT_SHA"
       - name: Wait for rollout
+        if: steps.config.outputs.enabled == 'true'
         run: |
-          kubectl -n apps rollout status deployment/dot --timeout=300s
-          kubectl -n apps get pods -l app=dot -o wide
+          kubectl -n "$DEPLOY_NAMESPACE" rollout status deployment/dot --timeout=300s
+          kubectl -n "$DEPLOY_NAMESPACE" get pods -l app=dot -o wide
+
+  mirror:
+    needs: verify
+    runs-on: general
+    if: forgejo.event_name == 'push' && forgejo.ref == 'refs/heads/main' && success()
+    container:
+      image: alpine:3.20
+    env:
+      GITHUB_MIRROR_REPO: ${{ vars.GITHUB_MIRROR_REPO }}
+      GITHUB_MIRROR_USER: ${{ vars.GITHUB_MIRROR_USER }}
+      GITHUB_MIRROR_TOKEN: ${{ secrets.GITHUB_MIRROR_TOKEN }}
+    steps:
+      - name: Check mirror configuration
+        id: config
+        run: |
+          if [ -z "$GITHUB_MIRROR_REPO" ] || [ -z "$GITHUB_MIRROR_TOKEN" ]; then
+            echo "GitHub mirror not configured (GITHUB_MIRROR_REPO, GITHUB_MIRROR_TOKEN); skipping"
+            echo "enabled=false" >> "$FORGEJO_OUTPUT"
+          else
+            echo "enabled=true" >> "$FORGEJO_OUTPUT"
+          fi
+      - name: Install action runtime
+        if: steps.config.outputs.enabled == 'true'
+        run: apk add --no-cache ca-certificates git nodejs
+      - name: Check out repository
+        if: steps.config.outputs.enabled == 'true'
+        uses: https://data.forgejo.org/actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Push main to GitHub mirror
+        if: steps.config.outputs.enabled == 'true'
+        run: |
+          case "$GITHUB_MIRROR_REPO" in
+            https://*) TARGET_URL="$GITHUB_MIRROR_REPO" ;;
+            *) TARGET_URL="https://github.com/${GITHUB_MIRROR_REPO%.git}.git" ;;
+          esac
+          USER="${GITHUB_MIRROR_USER:-x-access-token}"
+          AUTH="$(printf '%s:%s' "$USER" "$GITHUB_MIRROR_TOKEN" | base64 | tr -d '\n')"
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $AUTH" \
+            push --force "$TARGET_URL" HEAD:refs/heads/main --tags
+

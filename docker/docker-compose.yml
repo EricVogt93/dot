@@ -1,33 +1,40 @@
 name: dot
 
+# Default setup: bridge networking with the API published on host loopback
+# only. On hosts that cannot create bridge/veth interfaces, add the override:
+#   docker compose -f docker-compose.yml -f docker-compose.host-network.yml up -d
 services:
   dot:
     build:
       context: .
-      # This host cannot create Docker bridge interfaces; build with host
-      # networking. Remove if your Docker daemon supports bridge builds.
-      network: host
       args:
         CODEX_VERSION: ${CODEX_VERSION:-0.167.0}
+    image: ${DOT_IMAGE:-dot:local}
     container_name: ${DOT_CONTAINER_NAME:-dot}
     hostname: ${DOT_HOSTNAME:-dot-sandbox}
     init: true
     restart: unless-stopped
-    # Host networking: this workstation rejects veth/bridge creation. The API
-    # binds 127.0.0.1:${DOT_PORT} directly; no port mapping is needed.
-    network_mode: host
+    ports:
+      # Published on 127.0.0.1 only. Do not change to 0.0.0.0 without DOT_API_KEY.
+      - "127.0.0.1:${DOT_PORT:-8787}:8787"
     volumes:
       - dot-data:/data
       - ${DOT_WORKSPACE_HOST:-./workspace}:/workspace
+      # Optional auth seed. Must point to an existing file; otherwise Docker
+      # creates an empty directory and the container falls back to device login.
       - ${DOT_AUTH_FILE:-${HOME}/.codex/auth.json}:/seed/auth.json:ro
     environment:
       CODEX_HOME: /data/codex
-      DOT_API_PORT: ${DOT_PORT:-8787}
-      DOT_BIND: ${DOT_BIND:-127.0.0.1}
+      DOT_API_PORT: "8787"
+      # Inside the container network namespace; reachable only through the
+      # loopback port mapping above.
+      DOT_BIND: 0.0.0.0
       DOT_AUTH_SEED: /seed/auth.json
       DOT_DEVICE_LOGIN: ${DOT_DEVICE_LOGIN:-1}
       DOT_MODEL: ${DOT_MODEL:-}
       DOT_API_KEY: ${DOT_API_KEY:-}
+      DOT_CORS_ORIGINS: ${DOT_CORS_ORIGINS:-}
+      DOT_ANALYTICS: ${DOT_ANALYTICS:-0}
       DOT_SANDBOX: ${DOT_SANDBOX:-danger-full-access}
       DOT_APPROVAL_POLICY: ${DOT_APPROVAL_POLICY:-never}
       DOT_THREAD_MODE: ${DOT_THREAD_MODE:-persistent}

@@ -4,3 +4,6 @@ work/
 *.token
 .gitea-*
 .dot-*
+node_modules/
+docker/workspace/
+deploy/overlays/ci/

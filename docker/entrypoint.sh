@@ -9,12 +9,23 @@ export DOT_WORKSPACE="${DOT_WORKSPACE:-/workspace}"
 export DOT_API_PORT="${DOT_API_PORT:-8787}"
 export DOT_AUTH_SEED="${DOT_AUTH_SEED:-/seed/auth.json}"
 export DOT_DEVICE_LOGIN="${DOT_DEVICE_LOGIN:-1}"
+export DOT_MAX_LOG_BYTES="${DOT_MAX_LOG_BYTES:-10485760}"
 export PATH="/opt/codex-seed/bin:${PATH}"
 
 CODEX_BIN="${CODEX_BIN:-${CODEX_HOME}/packages/standalone/current/bin/codex}"
 export CODEX_BIN
 
 log() { printf '%s [dot] %s\n' "$(date -Is)" "$*"; }
+
+rotate_log() {
+  local file="$1" size
+  [[ -f "${file}" ]] || return 0
+  size="$(wc -c <"${file}" 2>/dev/null || echo 0)"
+  if [[ "${size}" -gt "${DOT_MAX_LOG_BYTES}" ]]; then
+    cp -f "${file}" "${file}.1" 2>/dev/null || true
+    : >"${file}"
+  fi
+}
 
 mkdir -p "${CODEX_HOME}" "${DOT_WORKSPACE}" "${HOME}/.cache" "${HOME}/.config"
 
@@ -55,33 +66,37 @@ fi
 # ---------------------------------------------------------------------------
 # 3. Authentication: seed from the host, otherwise run device-code login.
 # ---------------------------------------------------------------------------
-if [[ ! -f "${CODEX_HOME}/auth.json" && -f "${DOT_AUTH_SEED}" ]]; then
+if [[ ! -s "${CODEX_HOME}/auth.json" && -s "${DOT_AUTH_SEED}" ]]; then
   log "copying auth seed from ${DOT_AUTH_SEED}"
-  cp "${DOT_AUTH_SEED}" "${CODEX_HOME}/auth.json"
-  chmod 600 "${CODEX_HOME}/auth.json"
+  cp "${DOT_AUTH_SEED}" "${CODEX_HOME}/auth.json.tmp"
+  chmod 600 "${CODEX_HOME}/auth.json.tmp"
+  mv -f "${CODEX_HOME}/auth.json.tmp" "${CODEX_HOME}/auth.json"
 fi
 
-if [[ ! -f "${CODEX_HOME}/auth.json" && "${DOT_DEVICE_LOGIN}" != "0" ]]; then
+LOGIN_PID=""
+if [[ ! -s "${CODEX_HOME}/auth.json" && "${DOT_DEVICE_LOGIN}" != "0" ]]; then
   log "no auth.json found; starting ChatGPT device-code login in background"
+  : >"${CODEX_HOME}/login.log"
   (
     "${CODEX_BIN}" login --device-auth 2>&1 | tee -a "${CODEX_HOME}/login.log"
   ) &
+  LOGIN_PID=$!
   log "device login output is streamed to container logs and ${CODEX_HOME}/login.log"
 fi
 
 # ---------------------------------------------------------------------------
 # 4. Remote control: enroll this container as a connectable ChatGPT device.
 # ---------------------------------------------------------------------------
-
 record_remote_status() {
   local final="$1"
-  printf '%s\n' "${final}" >"${CODEX_HOME}/dot-remote-status.json"
+  local tmp="${CODEX_HOME}/dot-remote-status.json.tmp"
+  printf '%s\n' "${final}" >"${tmp}"
+  mv -f "${tmp}" "${CODEX_HOME}/dot-remote-status.json"
   log "remote control: ${final}"
 }
 
 start_remote_control() {
-  local output final attempt
-  final=''
+  local output final="" attempt
   for attempt in 1 2 3 4; do
     output="$("${CODEX_BIN}" remote-control start --json 2>&1)" || true
     final="$(printf '%s\n' "${output}" | jq -c 'select(.status != null)' 2>/dev/null | tail -n 1 || true)"
@@ -111,7 +126,7 @@ start_dots_executor() {
   if [[ -n "${DOTS_EXECUTOR_PID}" ]] && kill -0 "${DOTS_EXECUTOR_PID}" 2>/dev/null; then
     return 0
   fi
-  log "starting Dots local executor connector"
+  log "starting Dots local executor connector (EXPERIMENTAL, undocumented ChatGPT endpoints)"
   /app/dots-executor.sh >>"${CODEX_HOME}/dots-executor.log" 2>&1 &
   DOTS_EXECUTOR_PID=$!
   log "dots executor pid=${DOTS_EXECUTOR_PID}"
@@ -123,6 +138,8 @@ start_dots_executor
 # 6. HTTP API supervisor.
 # ---------------------------------------------------------------------------
 API_PID=""
+SLEEP_PID=""
+
 start_api() {
   node /app/server.js &
   API_PID=$!
@@ -133,11 +150,19 @@ start_api
 
 shutdown() {
   log "shutting down"
+  if [[ -n "${SLEEP_PID}" ]] && kill -0 "${SLEEP_PID}" 2>/dev/null; then
+    kill "${SLEEP_PID}" 2>/dev/null || true
+  fi
+  if [[ -n "${LOGIN_PID}" ]] && kill -0 "${LOGIN_PID}" 2>/dev/null; then
+    kill "${LOGIN_PID}" 2>/dev/null || true
+  fi
   if [[ -n "${DOTS_EXECUTOR_PID}" ]] && kill -0 "${DOTS_EXECUTOR_PID}" 2>/dev/null; then
     kill "${DOTS_EXECUTOR_PID}" 2>/dev/null || true
+    wait "${DOTS_EXECUTOR_PID}" 2>/dev/null || true
   fi
   if [[ -n "${API_PID}" ]] && kill -0 "${API_PID}" 2>/dev/null; then
     kill "${API_PID}" 2>/dev/null || true
+    wait "${API_PID}" 2>/dev/null || true
   fi
   "${CODEX_BIN}" app-server daemon stop >/dev/null 2>&1 || true
   exit 0
@@ -145,13 +170,18 @@ shutdown() {
 trap shutdown SIGTERM SIGINT
 
 while true; do
-  sleep 30 || true
+  sleep 30 &
+  SLEEP_PID=$!
+  wait "${SLEEP_PID}" 2>/dev/null || true
+  SLEEP_PID=""
+
   if [[ -z "${API_PID}" ]] || ! kill -0 "${API_PID}" 2>/dev/null; then
     log "api process is not running; restarting"
     start_api
   fi
 
   if [[ "${DOT_DOTS_EXECUTOR:-0}" == "1" ]]; then
+    rotate_log "${CODEX_HOME}/dots-executor.log"
     start_dots_executor
   fi
 

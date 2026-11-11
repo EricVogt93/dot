@@ -1,11 +1,16 @@
+# Generic Kubernetes manifests for dot. Customize with a Kustomize overlay
+# (namespace, image, storage class, node placement, PVC names, hostname).
+# See deploy/overlays/example/ and the README.
+#
+# Prerequisites in the target namespace:
+#   Secret/dot-auth     key auth.json  - Codex auth seed
+#   Secret/dot-api-key  key key        - bearer token for the HTTP API
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: dot-data-ts
-  namespace: apps
+  name: dot-data
 spec:
   accessModes: ["ReadWriteOnce"]
-  storageClassName: local-path
   resources:
     requests:
       storage: 20Gi
@@ -13,11 +18,9 @@ spec:
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: dot-workspace-ts
-  namespace: apps
+  name: dot-workspace
 spec:
   accessModes: ["ReadWriteOnce"]
-  storageClassName: local-path
   resources:
     requests:
       storage: 20Gi
@@ -26,10 +29,11 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: dot
-  namespace: apps
   labels:
     app: dot
 spec:
+  # One replica per installation: a second pod would reuse the same
+  # installation_id and collide with the online device.
   replicas: 1
   strategy:
     type: Recreate
@@ -43,17 +47,14 @@ spec:
     spec:
       automountServiceAccountToken: false
       terminationGracePeriodSeconds: 90
-      hostname: dot-k3s
-      nodeSelector:
-        kubernetes.io/hostname: thinkstation-k3s
-      imagePullSecrets:
-        - name: forgejo-registry
+      # Visible device name in ChatGPT.
+      hostname: dot
       securityContext:
         seccompProfile:
           type: RuntimeDefault
       containers:
         - name: dot
-          image: registry.ericvogt.com/root/dot:latest
+          image: dot
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
@@ -79,6 +80,8 @@ spec:
               value: never
             - name: DOT_THREAD_MODE
               value: persistent
+            # Required: without an API key the server rejects non-loopback
+            # Host headers, which would also fail the kubelet probes.
             - name: DOT_API_KEY
               valueFrom:
                 secretKeyRef:
@@ -120,10 +123,10 @@ spec:
       volumes:
         - name: data
           persistentVolumeClaim:
-            claimName: dot-data-ts
+            claimName: dot-data
         - name: workspace
           persistentVolumeClaim:
-            claimName: dot-workspace-ts
+            claimName: dot-workspace
         - name: auth
           secret:
             secretName: dot-auth
@@ -135,7 +138,6 @@ apiVersion: v1
 kind: Service
 metadata:
   name: dot
-  namespace: apps
   labels:
     app: dot
 spec:

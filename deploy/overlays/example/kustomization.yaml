@@ -1,0 +1,35 @@
+# Example overlay. Copy to deploy/overlays/<name>/ (or keep it outside the
+# repository) and adjust. Render with: kubectl kustomize deploy/overlays/example
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: dot
+resources:
+  - ../../base
+images:
+  - name: dot
+    newName: ghcr.io/your-org/dot
+    newTag: latest
+patches:
+  # Storage class for both PVCs.
+  - target:
+      kind: PersistentVolumeClaim
+    patch: |-
+      - op: add
+        path: /spec/storageClassName
+        value: standard
+  # Device name, node placement and private registry credentials.
+  - target:
+      kind: Deployment
+      name: dot
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/hostname
+        value: dot-k8s
+      # - op: add
+      #   path: /spec/template/spec/nodeSelector
+      #   value:
+      #     kubernetes.io/hostname: my-node
+      # - op: add
+      #   path: /spec/template/spec/imagePullSecrets
+      #   value:
+      #     - name: my-registry

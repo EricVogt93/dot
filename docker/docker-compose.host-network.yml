@@ -1,0 +1,14 @@
+# Override for hosts that cannot create Docker bridge/veth interfaces (nested
+# or restricted Docker). Builds and runs with host networking; the API binds
+# 127.0.0.1:${DOT_PORT} directly.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.host-network.yml up -d --build
+services:
+  dot:
+    build:
+      network: host
+    network_mode: host
+    ports: !reset []
+    environment:
+      DOT_API_PORT: ${DOT_PORT:-8787}
+      DOT_BIND: ${DOT_BIND:-127.0.0.1}

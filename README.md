@@ -1,107 +1,123 @@
-# dot
+<p align="center">
+  <img src="docs/icon.png" alt="dot" width="140" />
+</p>
 
-Run the ChatGPT/Codex desktop app's agent runtime (`codex` app-server) in a
-Docker container, expose it as an OpenAI-compatible chat API, and enroll the
-container as a **connectable source** in the ChatGPT GUI through Codex remote
-control.
+<h1 align="center">dot</h1>
 
-The reverse-engineering evidence is in
-[`docs/re-findings.md`](docs/re-findings.md). Runtime facts this project relies
-on:
+<p align="center">
+  Give ChatGPT / Dot (<b>"Your computer"</b> and <b>Codex remote control</b>) a clean, isolated container workspace on your PC or on a headless Linux server — plus a local HTTP bridge for health checks, pairing, and sandbox orchestration.
+</p>
 
-- `codex remote-control start --json` enrolls the host and returns
-  `{"status":"connected","serverName":…,"environmentId":…}`.
-- The enrolled host appears online in
-  `https://chatgpt.com/backend-api/wham/remote/control/environments` with its
-  `installation_id`, `client_type: CODEX_CLI`, and `originator:
-  codex_cli_rs`. This is the record the ChatGPT GUI renders as a device.
-- `codex app-server --listen stdio://` accepts newline-delimited JSON-RPC:
-  `thread/start` → `turn/start` → `item/agentMessage/delta` →
-  `turn/completed`.
-- `codex remote-control pair --json` returns a short manual pairing code for a
-  controller (phone/desktop GUI) to pair with the container.
+> [!IMPORTANT]
+> **Disclaimer — Intended Use & Terms**
+>
+> - **Why this exists:** This project is built solely to expose a **clean,
+>   container-isolated computer environment** (or a headless Linux server
+>   without an Electron GUI) to your own ChatGPT / Dot agent, so the agent can
+>   work inside a dedicated `/workspace` instead of having unrestricted access
+>   to your host's home directory, SSH keys, and browser profiles.
+> - **No modified binaries, no paywall bypass:** `dot` ships zero proprietary
+>   code. It installs and orchestrates the official, unmodified
+>   [OpenAI Codex CLI](https://github.com/openai/codex) (`codex`, Apache-2.0)
+>   and requires your own authenticated ChatGPT account (or `OPENAI_API_KEY`).
+>   It is **not** intended to be used as a general-purpose API proxy or to
+>   bypass API billing for third-party applications.
+> - **Unofficial project:** `dot` is an independent open-source project and is
+>   not affiliated with, endorsed by, or supported by OpenAI. "ChatGPT" and
+>   "Codex" are trademarks of their respective owners.
+> - **Use at your own risk:** The optional Dots local-computer connector
+>   (`DOT_DOTS_EXECUTOR=1`) and environment status lookup use undocumented
+>   backend endpoints that may change or stop working at any time. You are
+>   responsible for complying with the terms applicable to your account and for
+>   securing the directories you mount into `/workspace` (see [Security](#security)).
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-  GUI["ChatGPT GUI / phone<br/>remote-control controller"] -->|"wss<br/>/wham/remote/control/server"| DOT
+  GUI["ChatGPT GUI / phone<br/>remote-control controller"] -->|"wss"| DOT
   API["REST / OpenAI SDK clients"] -->|"/v1/chat/completions"| DOT
   DOT["dot container<br/>entrypoint + API :8787"] --> APP["codex app-server<br/>agent runtime"]
   APP --> MODEL["ChatGPT models"]
   APP --> WS["/workspace<br/>mounted sandboxes"]
-  DOT --> DAEMON["remote-control daemon<br/>connectable source"]
+  DOT --> DAEMON["remote-control daemon<br/>connectable device"]
 ```
 
-The container runs two cooperating processes with one `CODEX_HOME`:
+Two cooperating processes share one `CODEX_HOME`:
 
-1. `codex remote-control start` — the daemon that keeps the device enrolled
-   and reachable from the ChatGPT GUI.
-2. `node /app/server.js` — a zero-dependency HTTP bridge that owns a
-   long-lived `codex app-server` child and translates chat requests into
-   app-server turns.
+1. `codex remote-control start`: keeps the device enrolled and reachable.
+2. `node /app/server.js`: a zero-dependency HTTP bridge that owns a long-lived
+   `codex app-server` child and translates chat requests into turns.
 
 ## Quick start
 
+Requirements: Docker with Compose v2, and a ChatGPT account.
+
 ```bash
-cd docker
-
-# Optional: pick a model and a workspace on the host.
-export DOT_MODEL=gpt-6.1-sol
-export DOT_WORKSPACE_HOST="$HOME/src"
-
+git clone <this repository> dot && cd dot/docker
+cp .env.example .env            # optional: edit
 docker compose up -d --build
 docker compose logs -f dot
 ```
 
-The compose file mounts `${HOME}/.codex/auth.json` read-only as an auth seed.
-The entrypoint copies it into the `dot-data` volume on first start, so token
-refreshes do not modify the host file.
+The Compose file mounts `${HOME}/.codex/auth.json` read-only as a one-time
+auth seed and copies it into the `dot-data` volume if non-empty. If you do not
+have an `auth.json` yet, create an empty placeholder file before the first
+start so Docker does not mount a directory (`mkdir -p ~/.codex && touch ~/.codex/auth.json`);
+the container then runs device login, prints a ChatGPT URL and one-time code in
+the logs, and connects automatically once you confirm.
 
-This workstation rejects Docker bridge/veth creation, so the compose service
-uses `network_mode: host` and the API binds `127.0.0.1:${DOT_PORT}` directly.
-On a host with working bridge networking, replace `network_mode: host` with a
-port mapping if you prefer:
-
-```yaml
-    ports:
-      - "${DOT_PORT:-8787}:8787"
-    environment:
-      DOT_BIND: 0.0.0.0
-```
-
-If you have no host `auth.json`, leave the mount alone; the container prints a
-ChatGPT device-login URL and one-time code in `docker compose logs -f dot`.
-Open the URL, enter the code, and the entrypoint will connect remote control on
-the next retry.
-
-Check status:
+The API is published on `127.0.0.1:8787` only. Check it:
 
 ```bash
 curl -s localhost:8787/health | jq
 ```
 
-Expected after login:
+On hosts that cannot create Docker bridge interfaces (nested/restricted
+Docker), use host networking:
 
-```json
-{
-  "ok": true,
-  "auth": { "loggedIn": true, "authMode": "chatgpt", "accountIdPresent": true },
-  "remote": {
-    "connected": true,
-    "status": "connected",
-    "serverName": "dot-sandbox",
-    "environmentId": "env_e_…",
-    "installationId": "…"
-  }
-}
+```bash
+docker compose -f docker-compose.yml -f docker-compose.host-network.yml up -d --build
 ```
+
+## Building your own image
+
+Everything is built from this repository plus the official Codex installer.
+
+```bash
+# Build (CODEX_VERSION pins the Codex CLI release baked into the image)
+docker build -t dot:local --build-arg CODEX_VERSION=0.167.0 docker
+
+# Run
+docker run -d --name dot --hostname dot-sandbox --init \
+  -p 127.0.0.1:8787:8787 -e DOT_BIND=0.0.0.0 \
+  -v dot-data:/data \
+  -v "$PWD/workspace:/workspace" \
+  -v "$HOME/.codex/auth.json:/seed/auth.json:ro" \
+  dot:local
+```
+
+Notes:
+
+- The Dockerfile downloads `https://chatgpt.com/codex/install.sh` at build time.
+  Review it if you need supply-chain guarantees, or vendor your own Codex
+  package and adapt the `RUN` step.
+- Build behind a restricted network: add `--network=host` to `docker build`.
+- Push to your own registry:
+
+  ```bash
+  docker tag dot:local registry.example.com/you/dot:0.1.0
+  docker push registry.example.com/you/dot:0.1.0
+  ```
+
+- Compose builds from the same Dockerfile; set `DOT_IMAGE` to name the result.
+- Multi-arch images: `docker buildx build --platform linux/amd64,linux/arm64 ...`
+  (the Codex installer selects the matching binary).
 
 ## Make it visible in ChatGPT
 
 1. **Container is online.** `GET /v1/remote/environments` returns the
-   container's own record with `"online": true`. That is the same data the
-   ChatGPT GUI reads for its connectable-source list.
+   container's own record with `"online": true`.
 2. **Pair a controller (optional).** Generate a short code:
 
    ```bash
@@ -109,23 +125,11 @@ Expected after login:
    # { "manualPairingCode": "F9N5-PKB2", ... }
    ```
 
-   Enter that code in the ChatGPT GUI's "connect a device / add computer"
-   flow. The container's `environmentId` is the device it pairs with.
-3. **Select the device in ChatGPT.** The environment name comes from the
-   container hostname. Set `DOT_HOSTNAME=my-sandbox` (compose) or
-   `--hostname my-sandbox` (`docker run`) before first enrollment to control
-   the visible name.
-
-To confirm from the API without the GUI:
-
-```bash
-curl -s localhost:8787/v1/remote/environments \
-  | jq '.self | {display_name, online, os, app_server_version, last_seen_at}'
-```
+   Enter it in the ChatGPT GUI's device-pairing flow.
+3. **Name.** The visible name is the container hostname. Set `DOT_HOSTNAME`
+   (Compose) or `--hostname` (`docker run`) before first enrollment.
 
 ## Chat API
-
-### OpenAI-compatible, non-streaming
 
 ```bash
 curl -s localhost:8787/v1/chat/completions \
@@ -139,31 +143,15 @@ curl -s localhost:8787/v1/chat/completions \
   }' | jq -r '.choices[0].message.content'
 ```
 
-### Streaming (SSE)
+Streaming: add `"stream": true` and use `curl -N`. Simple helper:
+`POST /v1/chat` with `{"conversation_id": "...", "messages": [...]}` returns
+`{reply, thread_id, conversation_id}`.
 
-```bash
-curl -N localhost:8787/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"stream": true, "messages": [{"role": "user", "content": "Say hello"}]}'
-```
-
-### Simple helper
-
-```bash
-curl -s -X POST localhost:8787/v1/chat \
-  -H 'Content-Type: application/json' \
-  -d '{"conversation_id": "build", "messages": [{"role": "user", "content": "Status?"}]}' \
-  | jq -r '.reply'
-```
-
-`conversation_id` (also accepted as `metadata.conversation_id`,
-`x-conversation-id`, or `user`) maps to a persistent app-server thread. Later
-requests with the same id reuse the thread and its history; only the newest
-user message is sent per turn. A system/developer message is applied when the
-thread is created. Set `cwd` to a directory inside `/workspace` to run a turn
-against a specific project. Only text content parts are accepted.
-
-### Other endpoints
+`conversation_id` (also `metadata.conversation_id`, `x-conversation-id`, or
+`user`) maps to a persistent thread; later requests reuse its history and only
+the newest user message is sent per turn. A system/developer message applies
+when the thread is created. `cwd` must be inside `/workspace`. Only text
+content parts are accepted. Request bodies must be `application/json`.
 
 | Method | Path | Purpose |
 |---|---|---|
@@ -173,169 +161,138 @@ against a specific project. Only text content parts are accepted.
 | `POST` | `/v1/chat` | `{reply, thread_id, conversation_id}` |
 | `POST` | `/v1/interrupt` | `{thread_id}` interrupts the active turn |
 | `POST`/`GET` | `/v1/remote/pair` | Manual pairing code |
-| `GET` | `/v1/remote/environments` | GUI-visible environment list + `self` |
-
-Set `DOT_API_KEY` to require `Authorization: Bearer <key>` on every endpoint
-except `/health`.
-
-## Sandbox integration
-
-The container is the isolation boundary. Give it the directories the agent
-should orchestrate:
-
-```yaml
-volumes:
-  - /home/me/src/project-a:/workspace
-```
-
-For several independent sandboxes, run one container per sandbox with distinct
-names and ports; each gets its own `installation_id` and therefore its own
-connectable source:
-
-```bash
-docker run -d --name dot-a --hostname dot-a --network host \
-  -e DOT_API_PORT=8787 \
-  -v dot-a:/data -v ~/src/a:/workspace \
-  -v ~/.codex/auth.json:/seed/auth.json:ro dot-dot:latest
-
-docker run -d --name dot-b --hostname dot-b --network host \
-  -e DOT_API_PORT=8788 \
-  -v dot-b:/data -v ~/src/b:/workspace \
-  -v ~/.codex/auth.json:/seed/auth.json:ro dot-dot:latest
-```
-
-Never reuse a `/data` volume between containers: a duplicated
-`installation_id` collides with the already-online device and remote control
-stays in `connecting`/`errored`.
+| `GET` | `/v1/remote/environments` | Environment list plus `self` |
 
 ## Configuration
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `CODEX_VERSION` | `0.167.0` | Official standalone package pinned at build |
+| `CODEX_VERSION` | `0.167.0` | Codex CLI release pinned at build time |
+| `DOT_IMAGE` | `dot:local` | Image name used by Compose |
 | `DOT_HOSTNAME` | `dot-sandbox` | Container hostname → visible device name |
-| `DOT_PORT` | `8787` | Host API port (host networking) |
-| `DOT_BIND` | `127.0.0.1` | API bind address; set `0.0.0.0` only with a port mapping **and** `DOT_API_KEY` |
+| `DOT_PORT` | `8787` | Host API port |
+| `DOT_BIND` | `127.0.0.1` | API bind address (Compose sets `0.0.0.0` inside the container; the port is published on loopback only) |
 | `DOT_WORKSPACE_HOST` | `./workspace` | Host directory mounted at `/workspace` |
 | `DOT_AUTH_FILE` | `${HOME}/.codex/auth.json` | Host auth seed file |
 | `DOT_DEVICE_LOGIN` | `1` | Start device-code login when no auth exists |
 | `DOT_MODEL` | app default | Model passed to `thread/start` |
-| `DOT_SANDBOX` | `danger-full-access` | App-server sandbox mode inside container |
+| `DOT_SANDBOX` | `danger-full-access` | App-server sandbox mode inside the container |
 | `DOT_APPROVAL_POLICY` | `never` | App-server approval policy |
 | `DOT_THREAD_MODE` | `persistent` | `persistent` or `ephemeral` threads |
-| `DOT_DOTS_EXECUTOR` | `0` | Enable the Dots/Work local computer connector |
-| `DOT_DOTS_NAME` | hostname | Display name in the Dot's Computers list |
-| `DOT_DOTS_ATTACH` | `1` | Auto-attach to the primary Dot TBO |
-| `DOT_API_KEY` | empty | Bearer token required by the API |
+| `DOT_API_KEY` | empty | Bearer token required on every endpoint except `/health` |
+| `DOT_CORS_ORIGINS` | empty | Comma-separated allowed browser origins; `*` only works with `DOT_API_KEY` |
+| `DOT_ANALYTICS` | `0` | Pass `--analytics-default-enabled` to the app-server |
 | `DOT_TURN_TIMEOUT_MS` | `600000` | Per-turn timeout |
+| `DOT_DOTS_EXECUTOR` | `0` | Experimental Dots connector, see [docs/dots-executor.md](docs/dots-executor.md) |
+
+## Several sandboxes
+
+Run one container per sandbox with distinct names, ports and **separate data
+volumes**; each gets its own `installation_id` and device:
+
+```bash
+docker run -d --name dot-a --hostname dot-a --network host -e DOT_API_PORT=8787 \
+  -v dot-a:/data -v ~/src/a:/workspace -v ~/.codex/auth.json:/seed/auth.json:ro dot:local
+docker run -d --name dot-b --hostname dot-b --network host -e DOT_API_PORT=8788 \
+  -v dot-b:/data -v ~/src/b:/workspace -v ~/.codex/auth.json:/seed/auth.json:ro dot:local
+```
 
 ## Security
 
-The API grants an agent shell access to `/workspace` with the configured
-sandbox. Treat it as a remote-code-execution endpoint:
+The API grants an agent shell access to `/workspace`. Treat it as a
+remote-code-execution endpoint. See [SECURITY.md](SECURITY.md).
 
-- The API binds `127.0.0.1` by default. Keep it loopback-only unless you set
-  `DOT_API_KEY`; set `DOT_BIND=0.0.0.0` only when a bridge/port mapping
-  requires it, and never expose it without the key.
-- Mount only directories the agent should touch.
-- The default `danger-full-access` is scoped by the container; do not mount
-  the Docker socket, SSH keys, or the whole home directory.
-- `auth.json` in the volume contains ChatGPT tokens. Keep the volume private.
+- Loopback only by default. Without `DOT_API_KEY`, non-loopback `Host` headers
+  and cross-origin browser requests are rejected. Set `DOT_API_KEY` before
+  exposing the API anywhere else.
+- Mount only directories the agent should touch; never the Docker socket, SSH
+  keys, or your home directory.
+- `danger-full-access` relies on the container as the boundary.
+- `/data` contains ChatGPT tokens. Keep the volume private.
 
 ## Troubleshooting
 
-- **`remote.connected: false` on first boot.** The first `remote-control
-  start` can race the auth copy; the entrypoint retries immediately and every
-  30 seconds. Check `docker logs dot` for `remote control: {"status":...}`.
-- **`status: connecting` or `errored` with a reused volume.** The
-  `installation_id` is already online in another container. Remove the volume
-  and start fresh (`docker compose down -v`).
-- **Build fails with `failed to add the host <=> sandbox pair interfaces`.**
-  The host cannot create Docker bridge interfaces (nested/restricted Docker).
-  The compose file already builds with `network: host` and runs with
-  `network_mode: host`. For a raw `docker build`, add `--network=host`; for
-  `docker run`, use `--network host` with `-e DOT_API_PORT=…` instead of `-p`.
-- **Chat returns 401/`app-server` errors.** The auth seed was not copied or
-  the device login did not complete. Check `/health` and
-  `/data/codex/login.log` in the volume.
-- **GUI does not show the device.** Confirm the environment is `online` in
-  `GET /v1/remote/environments`; the GUI reads the same backend record.
-  Re-pair a controller with `/v1/remote/pair` if needed.
+- **`remote.connected: false` on first boot.** The first enrollment can race
+  the auth copy; the entrypoint retries every 30 s. Look for
+  `remote control: {"status":...}` in `docker logs dot`.
+- **`connecting`/`errored` with a reused volume.** The `installation_id` is
+  already online elsewhere. Remove the volume (`docker compose down -v`).
+- **`failed to add the host <=> sandbox pair interfaces`.** Docker cannot
+  create bridges; use the host-network override above and
+  `docker build --network=host`.
+- **Chat returns 401 / app-server errors.** The auth seed was not copied or
+  the device login did not finish. Check `/health` and `/data/codex/login.log`.
+- **Device not visible in ChatGPT.** Confirm `online` in
+  `GET /v1/remote/environments`; re-pair with `/v1/remote/pair`.
 
-## Dots local computer connector
+## Kubernetes
 
-Set `DOT_DOTS_EXECUTOR=1` to let ChatGPT Dots/Work use this container as a
-local computer (separate from Codex remote control). The entrypoint then runs
-`/app/dots-executor.sh`, which:
-
-1. registers a local Work executor at
-   `POST https://chatgpt.com/backend-api/flora/cca/executor`;
-2. starts `codex exec-server --remote https://codex-cloud-environments.chatgpt.com/api`
-   and keeps it alive;
-3. attaches the executor to the primary Dot TBO via
-   `/tbo/{tbo}/computers/{env}/connect-and-replace`.
-
-The stable installation id lives in
-`/data/codex/.tpp-local-executor-installation-id`; the executor id is cached in
-`/data/codex/.dots-executor-environment-id`. Logs go to
-`/data/codex/dots-executor.log` and `/data/codex/dots-exec-server.log`.
-
-Useful env vars:
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `DOT_DOTS_EXECUTOR` | `0` | `1` enables the connector |
-| `DOT_DOTS_NAME` | container hostname | Display name in the Dot's Computers list |
-| `DOT_DOTS_ATTACH` | `1` | Attach to the primary Dot TBO automatically |
-| `DOT_DOTS_TBO_THREAD_ID` | auto (`/tbo/primary`) | Explicit Dot thread id |
-| `DOT_DOTS_TBO_ID` | auto (`/tbo/by-thread`) | Explicit TBO id |
-| `DOT_DOTS_POLL_SECONDS` | `60` | Attachment re-check interval |
-| `DOT_DOTS_REMOTE_URL` | production registry | Executor rendezvous API |
-
-This connector grants the Dot access to `/workspace` and the container; enable
-it only for sandboxes that should be visible as a Dot computer.
-
-## Kubernetes (k3s)
-
-`main` is production: a push builds and pushes
-`registry.ericvogt.com/root/dot:<sha>`, then applies `deploy/k8s.yaml` and
-updates the `apps/dot` Deployment. `development` runs the same checks and image
-build without deploying. Both branches are protected against deletion.
-
-One-time cluster prerequisites (already created in `apps`):
-
-- `Secret/dot-auth` — seed `auth.json`.
-- `Secret/dot-api-key` — bearer token required by the API.
-- `Secret/forgejo-registry` — image pull secret for `registry.ericvogt.com`.
-- `ServiceAccount/dot-deployer` + Role/RoleBinding — CI can manage only
-  Deployments, Services, PVCs, ConfigMaps and Pods in `apps`.
-
-The pod is pinned to node `thinkstation-k3s` (ts3), uses local-path PVCs
-`dot-data-ts` and `dot-workspace-ts`, and sets `hostname: dot-k3s` (the ChatGPT
-device name). The
-API is ClusterIP-only; use port-forward:
+Generic manifests live in `deploy/base` (Kustomize). Create the prerequisites
+in your namespace, then apply an overlay:
 
 ```bash
-kubectl -n apps port-forward svc/dot 8787:8787
-kubectl -n apps get secret dot-api-key -o jsonpath='{.data.key}' | base64 -d
-curl -s localhost:8787/health
+kubectl create namespace dot
+kubectl -n dot create secret generic dot-auth --from-file=auth.json=$HOME/.codex/auth.json
+kubectl -n dot create secret generic dot-api-key --from-literal=key="$(openssl rand -hex 32)"
+
+cp -r deploy/overlays/example deploy/overlays/mine   # set image, storage class, ...
+kubectl apply -k deploy/overlays/mine
+kubectl -n dot port-forward svc/dot 8787:8787
 ```
 
-Forgejo repository secrets: `REGISTRY_TOKEN`, `KUBE_CONFIG`; variable:
-`REGISTRY_USER=root`.
+`DOT_API_KEY` is mandatory in the cluster (the Service is ClusterIP-only and
+probes use non-loopback Host headers). Run exactly one replica per data volume.
+
+## CI and releases
+
+Development happens on the primary Forgejo repository. The GitHub repository is
+a read-only mirror and runs no workflows. [`.forgejo/workflows/ci.yml`](.forgejo/workflows/ci.yml)
+runs lint and tests on every push and pull request, builds the image, and, if
+configured, pushes it and deploys from `main`:
+
+| Setting | Kind | Purpose |
+|---|---|---|
+| `REGISTRY` | variable | Registry host; unset means build without pushing |
+| `REGISTRY_USER` / `REGISTRY_TOKEN` | variable / secret | Registry login |
+| `DEPLOY_NAMESPACE` | variable | Namespace for the deploy job |
+| `KUBE_CONFIG` | secret | Kubeconfig for the deploy job |
+| `DEPLOY_KUSTOMIZATION` | secret | Content of a private overlay `kustomization.yaml` (namespace, image, storage, node placement) |
+| `GITHUB_MIRROR_REPO` | variable | GitHub mirror target (`owner/dot` or `https://github.com/owner/dot.git`) |
+| `GITHUB_MIRROR_TOKEN` | secret | GitHub PAT (`Contents: Read and write`) used to push `main` and tags on `main` pushes |
+
+The deploy job is skipped when any of these are missing. The `image` job
+mounts a Podman socket path specific to the original runner; adjust the
+`options:` line for your runner.
+
+## Development
+
+```bash
+cd docker
+npm run lint
+npm test    # fake codex, no network or auth required
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Layout
 
 ```
 docker/
-  Dockerfile          # node bookworm + official standalone Codex package
-  entrypoint.sh       # seed, auth, remote control, API supervisor
-  server.js           # zero-dependency HTTP ↔ app-server bridge
-  docker-compose.yml
+  Dockerfile                    # node bookworm + official standalone Codex package
+  entrypoint.sh                 # seed, auth, remote control, API supervisor
+  server.js                     # zero-dependency HTTP <-> app-server bridge
+  dots-executor.sh              # experimental Dots connector
+  docker-compose.yml            # bridge networking, loopback port
+  docker-compose.host-network.yml
+  test/                         # node:test suite + fake codex
 deploy/
-  k8s.yaml            # k3s Deployment/Service/PVCs (apps namespace)
-.forgejo/workflows/
-  ci.yml              # test, build/push, deploy on main
-docs/re-findings.md   # Hopper/app.asar evidence and protocol notes
-data/                 # extracted ChatGPT desktop .deb (analysis input, not committed)
+  base/                         # generic Kustomize base
+  overlays/example/             # template overlay
+docs/
+  protocol.md                   # how dot uses the Codex CLI
+  dots-executor.md              # experimental connector
 ```
+
+## License
+
+[Apache-2.0](LICENSE)

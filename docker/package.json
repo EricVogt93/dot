@@ -1,11 +1,17 @@
 {
   "name": "dot-container",
-  "version": "1.0.0",
+  "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "OpenAI-compatible HTTP bridge for the Codex app-server",
+  "description": "OpenAI-compatible HTTP bridge and remote-control container for the Codex app-server",
+  "license": "Apache-2.0",
   "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test test/",
+    "lint": "node --check server.js && bash -n entrypoint.sh && bash -n dots-executor.sh"
+  },
   "engines": {
-    "node": ">=24"
+    "node": ">=22"
   }
 }
