@@ -84,7 +84,7 @@ jobs:
       image_ref: ${{ steps.digest.outputs.image_ref }}
     steps:
       - name: Install action runtime
-        run: apk add --no-cache bash git nodejs
+        run: apk add --no-cache bash curl git jq nodejs
       - name: Check out repository
         uses: https://data.forgejo.org/actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -148,20 +148,33 @@ jobs:
             echo "vars.REGISTRY is not set; no digest output (deploy stays disabled)"
             exit 0
           fi
-          # Exactly one RepoDigest must match this repository.
-          MATCHES="$(docker image inspect "$IMAGE:$REVISION" \
-            --format '{{range .RepoDigests}}{{println .}}{{end}}' \
-            | grep -F "$IMAGE@" || true)"
-          COUNT="$(printf '%s' "$MATCHES" | grep -c . || true)"
-          if [ "$COUNT" != "1" ]; then
-            echo "expected exactly one RepoDigest for $IMAGE, found $COUNT" >&2
-            exit 1
+          : "${REGISTRY_USER:?Forgejo variable REGISTRY_USER is required}"
+          : "${REGISTRY_TOKEN:?Forgejo secret REGISTRY_TOKEN is required}"
+          # Local RepoDigests can be stale (podman recompresses layers on
+          # push). The registry's own digest for the pushed tag is the only
+          # deployable truth.
+          REPO="${IMAGE#"$REGISTRY/"}"
+          ACCEPT='Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json'
+          HEADERS="$(curl -fsS -o /dev/null -D - "https://$REGISTRY/v2/" || true)"
+          AUTH_ARGS=()
+          WWW="$(printf '%s' "$HEADERS" | grep -i '^www-authenticate:' || true)"
+          if [ -n "$WWW" ]; then
+            REALM="$(printf '%s' "$WWW" | sed -n 's/.*realm="\([^"]*\)".*/\1/p')"
+            SERVICE="$(printf '%s' "$WWW" | sed -n 's/.*service="\([^"]*\)".*/\1/p')"
+            TOKEN="$(curl -fsS -u "$REGISTRY_USER:$REGISTRY_TOKEN" \
+              "$REALM?service=$SERVICE&scope=repository:$REPO:pull" | jq -r '.token // .access_token')"
+            AUTH_ARGS=(-H "Authorization: Bearer $TOKEN")
+          else
+            AUTH_ARGS=(-u "$REGISTRY_USER:$REGISTRY_TOKEN")
           fi
-          case "$MATCHES" in
-            "$IMAGE@sha256:"????????????????????????????????????????????????????????????????) ;;
-            *) echo "unexpected digest format: $MATCHES" >&2; exit 1 ;;
+          DIGEST="$(curl -fsS -o /dev/null -D - "${AUTH_ARGS[@]}" -H "$ACCEPT" \
+            "https://$REGISTRY/v2/$REPO/manifests/$REVISION" \
+            | grep -i '^docker-content-digest:' | tr -d '\r' | awk '{print $2}')"
+          case "$DIGEST" in
+            sha256:????????????????????????????????????????????????????????????????) ;;
+            *) echo "registry returned no usable digest for $IMAGE:$REVISION: '$DIGEST'" >&2; exit 1 ;;
           esac
-          echo "image_ref=$MATCHES" >> "$FORGEJO_OUTPUT"
+          echo "image_ref=$IMAGE@$DIGEST" >> "$FORGEJO_OUTPUT"
 
   deploy:
     needs: image
