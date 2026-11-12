@@ -149,17 +149,23 @@ Streaming: add `"stream": true` and use `curl -N`. Simple helper:
 
 `conversation_id` (also `metadata.conversation_id`, `x-conversation-id`, or
 `user`) maps to a persistent thread; later requests reuse its history and only
-the newest user message is sent per turn. A system/developer message applies
-when the thread is created. `cwd` must be inside `/workspace`. Only text
-content parts are accepted. Request bodies must be `application/json`.
+the newest user message is sent per turn. Without any identifier each request
+gets its own conversation (streaming responses expose it via the
+`X-Conversation-Id` header). A system/developer message applies when the
+thread is created; explicitly changing `model`, `cwd` or instructions on an
+existing conversation returns `409` — use a new `conversation_id`. `cwd` must
+be inside `/workspace`. Only text content parts are accepted. Request bodies
+must be `application/json`.
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/health` | Codex version, auth state, remote-control state |
+| `GET` | `/livez` | Liveness: HTTP process serves requests (no auth required) |
+| `GET` | `/readyz` | Readiness: initialized app-server + auth configuration; 503 otherwise |
+| `GET` | `/health` | Diagnostics: Codex version, auth, remote state, readiness |
 | `GET` | `/v1/models` | Minimal model list |
 | `POST` | `/v1/chat/completions` | OpenAI chat completions (stream or JSON) |
 | `POST` | `/v1/chat` | `{reply, thread_id, conversation_id}` |
-| `POST` | `/v1/interrupt` | `{thread_id}` interrupts the active turn |
+| `POST` | `/v1/interrupt` | `{thread_id}` interrupts the active turn; responds after the turn ends |
 | `POST`/`GET` | `/v1/remote/pair` | Manual pairing code |
 | `GET` | `/v1/remote/environments` | Environment list plus `self` |
 
@@ -179,7 +185,7 @@ content parts are accepted. Request bodies must be `application/json`.
 | `DOT_SANDBOX` | `danger-full-access` | App-server sandbox mode inside the container |
 | `DOT_APPROVAL_POLICY` | `never` | App-server approval policy |
 | `DOT_THREAD_MODE` | `persistent` | `persistent` or `ephemeral` threads |
-| `DOT_API_KEY` | empty | Bearer token required on every endpoint except `/health` |
+| `DOT_API_KEY` | empty | Bearer token required on every endpoint except `/health`, `/livez`, `/readyz` |
 | `DOT_CORS_ORIGINS` | empty | Comma-separated allowed browser origins; `*` only works with `DOT_API_KEY` |
 | `DOT_ANALYTICS` | `0` | Pass `--analytics-default-enabled` to the app-server |
 | `DOT_TURN_TIMEOUT_MS` | `600000` | Per-turn timeout |
@@ -213,8 +219,10 @@ remote-code-execution endpoint. See [SECURITY.md](SECURITY.md).
 ## Troubleshooting
 
 - **`remote.connected: false` on first boot.** The first enrollment can race
-  the auth copy; the entrypoint retries every 30 s. Look for
-  `remote control: {"status":...}` in `docker logs dot`.
+  the auth copy; the remote-control worker retries every 30 s. Look for
+  `[remote-control] status: {...}` in `docker logs dot`. `connected: true`
+  additionally requires a status check within the last 90 s; an old check is
+  reported as `stale`.
 - **`connecting`/`errored` with a reused volume.** The `installation_id` is
   already online elsewhere. Remove the volume (`docker compose down -v`).
 - **`failed to add the host <=> sandbox pair interfaces`.** Docker cannot
@@ -247,8 +255,12 @@ probes use non-loopback Host headers). Run exactly one replica per data volume.
 
 Development happens on the primary Forgejo repository. The GitHub repository is
 a read-only mirror and runs no workflows. [`.forgejo/workflows/ci.yml`](.forgejo/workflows/ci.yml)
-runs lint and tests on every push and pull request, builds the image, and, if
-configured, pushes it and deploys from `main`:
+runs lint and the offline suite on Node 22 and 24, tests the deployment
+renderer, builds the image, qualifies the built image offline
+(`docker/verify-image.sh`, no network), and only then pushes and — if
+configured — deploys from `main` using the exact registry digest
+(`deploy/render.py` renders one fully determined manifest set; a single
+`kubectl apply`, no after-the-fact image patch):
 
 | Setting | Kind | Purpose |
 |---|---|---|
@@ -269,7 +281,17 @@ mounts a Podman socket path specific to the original runner; adjust the
 ```bash
 cd docker
 npm run lint
-npm test    # fake codex, no network or auth required
+npm test               # full offline gate: fake codex, no network or auth
+npm run test:unit      # helper/validation logic only
+npm run test:bridge    # JSON-RPC, chat, SSE, queue, abort, restart, probes
+npm run test:supervisor # runtime seeding, auth seed, process supervision
+
+# Qualify an actually built image (requires a Docker daemon):
+docker build -t dot:reliability .
+DOT_TEST_IMAGE=dot:reliability npm run test:image
+
+# Deployment rendering (from the repo root; needs kubectl + PyYAML):
+python3 -m unittest discover -s deploy -p test_render.py
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).
@@ -279,15 +301,19 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 ```
 docker/
   Dockerfile                    # node bookworm + official standalone Codex package
-  entrypoint.sh                 # seed, auth, remote control, API supervisor
+  entrypoint.sh                 # runtime seeding, auth, bounded supervision
+  remote-control.sh             # enrollment worker (atomic status + checkedAt)
   server.js                     # zero-dependency HTTP <-> app-server bridge
   dots-executor.sh              # experimental Dots connector
+  verify-image.sh               # offline qualification of a built image
   docker-compose.yml            # bridge networking, loopback port
   docker-compose.host-network.yml
-  test/                         # node:test suite + fake codex
+  test/                         # node:test suites + fake codex + image smoke
 deploy/
   base/                         # generic Kustomize base
   overlays/example/             # template overlay
+  render.py                     # digest-pinned manifest renderer
+  test_render.py                # renderer tests (kubectl kustomize, no cluster)
 docs/
   protocol.md                   # how dot uses the Codex CLI
   dots-executor.md              # experimental connector

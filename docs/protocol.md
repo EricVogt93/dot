@@ -32,16 +32,20 @@ stdin/stdout. dot uses this subset:
 | Direction | Message | Purpose |
 |---|---|---|
 | → | `initialize` / `initialized` | Handshake with `clientInfo` |
-| → | `thread/start` | New thread (`cwd`, `sandbox`, `approvalPolicy`, `model`, `developerInstructions`) |
+| → | `thread/start` | New thread (`cwd`, `sandbox`, `approvalPolicy`, `model`, `developerInstructions`); the response's `model`/`cwd` are the actual configuration |
 | → | `turn/start` | Send user input to a thread |
 | → | `turn/interrupt` | Cancel the running turn |
 | ← | `item/agentMessage/delta` | Streaming assistant text |
-| ← | `turn/completed` | Turn finished (`items` or `error`) |
-| ← | `execCommandApproval`, `applyPatchApproval`, `fileChangeRequestApproval` | Approved automatically (the container is the sandbox) |
-| ← | `permissionsRequestApproval` | Rejected with a JSON-RPC error: dot never widens the sandbox |
+| ← | `turn/completed` | Terminal turn state: `status` is `completed`, `interrupted` or `failed` (with nullable structured `error`); text may arrive in `items` |
+| ← | `error` | Turn error notification (`error`, `willRetry`, `threadId`, `turnId`); `willRetry: true` means Codex retries internally and the turn stays open |
+| ← | `item/commandExecution/requestApproval`, `item/fileChange/requestApproval` | V2 approvals: answered `{decision: "accept"}` only with `approval_policy = "never"` and `sandbox = "danger-full-access"`, otherwise `{decision: "decline"}`; `kind: "humanCommand"` is always declined |
+| ← | `item/permissions/requestApproval` | Rejected with JSON-RPC `-32601`: dot never widens the sandbox |
+| ← | `item/tool/requestUserInput` | Answered with `{answers: {}}` |
 
-The authoritative schema comes from the Codex CLI itself; see the upstream
-repository.
+The authoritative schema comes from the Codex CLI itself
+(`codex app-server generate-json-schema --experimental`); the image smoke
+test checks the consumed methods, decisions, statuses and required fields
+against the schemas of the exact bundled release.
 
 ## Authentication
 

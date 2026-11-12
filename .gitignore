@@ -7,3 +7,4 @@ work/
 node_modules/
 docker/workspace/
 deploy/overlays/ci/
+__pycache__/

@@ -97,19 +97,19 @@ spec:
               readOnly: true
           startupProbe:
             httpGet:
-              path: /health
+              path: /livez
               port: http
             periodSeconds: 5
             failureThreshold: 60
           readinessProbe:
             httpGet:
-              path: /health
+              path: /readyz
               port: http
             periodSeconds: 10
             failureThreshold: 3
           livenessProbe:
             httpGet:
-              path: /health
+              path: /livez
               port: http
             periodSeconds: 30
             failureThreshold: 3

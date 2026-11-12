@@ -28,9 +28,10 @@ THREAD_ID="${DOT_DOTS_TBO_THREAD_ID:-}"
 TBO_ID="${DOT_DOTS_TBO_ID:-}"
 WORKSPACE="${DOT_WORKSPACE:-/workspace}"
 
-BODY_FILE="$(mktemp)"
+BODY_FILE=""
 CHILD=""
 SLEEP_PID=""
+SHUTTING_DOWN=0
 
 log() { printf '%s [dots-executor] %s\n' "$(date -Is)" "$*" >&2; }
 
@@ -95,8 +96,22 @@ ensure_installation_id() {
   printf '%s' "${iid}"
 }
 
+# Interruptible sleep: shutdown signals must not wait out retry phases.
+nap() {
+  local seconds="$1"
+  (( SHUTTING_DOWN )) && return 0
+  sleep "${seconds}" &
+  SLEEP_PID=$!
+  wait "${SLEEP_PID}" 2>/dev/null || true
+  SLEEP_PID=""
+}
+
+# Sets the global REGISTERED_ENV_ID; runs in the main shell so TERM traps
+# interrupt the retry loop (a command-substitution subshell would not).
+REGISTERED_ENV_ID=""
 register_executor() {
   local iid roots body code attempt env_id
+  REGISTERED_ENV_ID=""
   iid="$(ensure_installation_id)"
   roots='[]'
   if [[ -d "${CODEX_HOME}/skills" ]]; then
@@ -109,18 +124,19 @@ register_executor() {
     '{displayName:$name, installation_id:$iid, selected_capability_roots:$roots}')"
 
   for attempt in $(seq 1 12); do
+    (( SHUTTING_DOWN )) && return 1
     code="$(http POST /flora/cca/executor "${body}")"
     if [[ "${code}" == "200" || "${code}" == "201" ]]; then
       env_id="$(jq -r '.executor_id // empty' "${BODY_FILE}")"
       if valid_id "${env_id}"; then
         write_secret_file "${ENVIRONMENT_FILE}" "${env_id}"
         log "registered executor ${env_id} as ${DOTS_NAME} (installation ${iid})"
-        printf '%s' "${env_id}"
+        REGISTERED_ENV_ID="${env_id}"
         return 0
       fi
     fi
     log "registration attempt ${attempt} failed (HTTP ${code}); retrying"
-    sleep 10
+    nap 10
   done
   return 1
 }
@@ -189,56 +205,83 @@ attach_computer() {
   return 1
 }
 
+# Bounded cleanup: never wait indefinitely on the exec-server child.
 cleanup() {
-  rm -f "${BODY_FILE}"
+  [[ -n "${BODY_FILE}" ]] && rm -f "${BODY_FILE}"
   if [[ -n "${SLEEP_PID}" ]] && kill -0 "${SLEEP_PID}" 2>/dev/null; then
     kill "${SLEEP_PID}" 2>/dev/null || true
   fi
   if [[ -n "${CHILD}" ]] && kill -0 "${CHILD}" 2>/dev/null; then
-    kill "${CHILD}" 2>/dev/null || true
+    kill -TERM -- "-${CHILD}" 2>/dev/null || kill -TERM "${CHILD}" 2>/dev/null || true
+    local deadline=$((SECONDS + 3))
+    while (( SECONDS < deadline )) && kill -0 "${CHILD}" 2>/dev/null; do
+      sleep 0.1
+    done
+    if kill -0 "${CHILD}" 2>/dev/null; then
+      kill -KILL -- "-${CHILD}" 2>/dev/null || kill -KILL "${CHILD}" 2>/dev/null || true
+    fi
     wait "${CHILD}" 2>/dev/null || true
   fi
 }
 
-trap 'cleanup; exit 0' TERM INT EXIT
+on_signal() {
+  SHUTTING_DOWN=1
+  cleanup
+  exit 0
+}
 
-log "starting connector for ${DOTS_NAME} (codex=${CODEX_BIN})"
-while true; do
-  ENV_ID="$(register_executor)" || {
-    log "registration failed; retrying"
-    sleep 15 &
-    SLEEP_PID=$!
-    wait "${SLEEP_PID}" 2>/dev/null || true
-    SLEEP_PID=""
-    continue
-  }
-  attach_computer || true
+on_exit() {
+  local code=$?
+  cleanup
+  exit "${code}"
+}
 
-  log "starting exec-server for ${ENV_ID}"
-  CODEX_HOME="${CODEX_HOME}" \
-  CODEX_INTERNAL_ORIGINATOR_OVERRIDE=codex_work_desktop \
-  CODEX_EXEC_SERVER_EXIT_ON_STDIN_CLOSE=false \
-  CODEX_TASK_WORKSPACE_NODE="${WORKSPACE}" \
-  LOG_FORMAT=json \
-  RUST_LOG="${RUST_LOG:-info},codex_exec_server::remote=info" \
-  "${CODEX_BIN}" -c forced_login_method="chatgpt" exec-server \
-    --concurrent-requests "${CONCURRENT_REQUESTS}" \
-    --remote "${REMOTE_URL}" \
-    --environment-id "${ENV_ID}" \
-    </dev/null >>"${EXEC_LOG}" 2>&1 &
-  CHILD=$!
-  log "exec-server pid=${CHILD}"
+main() {
+  BODY_FILE="$(mktemp)"
+  trap 'on_signal' TERM INT
+  trap 'on_exit' EXIT
 
-  while kill -0 "${CHILD}" 2>/dev/null; do
-    sleep "${POLL_SECONDS}" &
-    SLEEP_PID=$!
-    wait "${SLEEP_PID}" 2>/dev/null || true
-    SLEEP_PID=""
-    rotate_log "${EXEC_LOG}"
+  log "starting connector for ${DOTS_NAME} (codex=${CODEX_BIN})"
+  while (( SHUTTING_DOWN == 0 )); do
+    register_executor || {
+      (( SHUTTING_DOWN )) && break
+      log "registration failed; retrying"
+      nap 15
+      continue
+    }
+    ENV_ID="${REGISTERED_ENV_ID}"
     attach_computer || true
+    (( SHUTTING_DOWN )) && break
+
+    log "starting exec-server for ${ENV_ID}"
+    CODEX_HOME="${CODEX_HOME}" \
+    CODEX_INTERNAL_ORIGINATOR_OVERRIDE=codex_work_desktop \
+    CODEX_EXEC_SERVER_EXIT_ON_STDIN_CLOSE=false \
+    CODEX_TASK_WORKSPACE_NODE="${WORKSPACE}" \
+    LOG_FORMAT=json \
+    RUST_LOG="${RUST_LOG:-info},codex_exec_server::remote=info" \
+    setsid "${CODEX_BIN}" -c forced_login_method="chatgpt" exec-server \
+      --concurrent-requests "${CONCURRENT_REQUESTS}" \
+      --remote "${REMOTE_URL}" \
+      --environment-id "${ENV_ID}" \
+      </dev/null >>"${EXEC_LOG}" 2>&1 &
+    CHILD=$!
+    log "exec-server pid=${CHILD}"
+
+    while (( SHUTTING_DOWN == 0 )) && kill -0 "${CHILD}" 2>/dev/null; do
+      nap "${POLL_SECONDS}"
+      (( SHUTTING_DOWN )) && break
+      rotate_log "${EXEC_LOG}"
+      attach_computer || true
+    done
+    wait "${CHILD}" 2>/dev/null || true
+    CHILD=""
+    (( SHUTTING_DOWN )) && break
+    log "exec-server exited; restarting"
+    nap 5
   done
-  wait "${CHILD}" 2>/dev/null || true
-  CHILD=""
-  log "exec-server exited; restarting"
-  sleep 5
-done
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

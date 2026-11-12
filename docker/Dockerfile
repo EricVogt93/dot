@@ -14,11 +14,13 @@ RUN apt-get update \
   && apt-get install -y --no-install-recommends \
     bash \
     ca-certificates \
+    coreutils \
     curl \
     git \
     jq \
     less \
     procps \
+    util-linux \
     xz-utils \
   && rm -rf /var/lib/apt/lists/*
 
@@ -36,8 +38,8 @@ RUN curl -fsSL https://chatgpt.com/codex/install.sh -o /tmp/codex-install.sh \
   && test -x /opt/codex-seed/packages/standalone/current/bin/codex
 
 WORKDIR /app
-COPY package.json server.js entrypoint.sh dots-executor.sh ./
-RUN chmod +x /app/entrypoint.sh /app/dots-executor.sh
+COPY package.json server.js entrypoint.sh dots-executor.sh remote-control.sh ./
+RUN chmod +x /app/entrypoint.sh /app/dots-executor.sh /app/remote-control.sh
 
 ENV CODEX_HOME=/data/codex \
     HOME=/data \
@@ -52,6 +54,6 @@ VOLUME ["/data"]
 EXPOSE 8787
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
-  CMD curl -fsS "http://127.0.0.1:${DOT_API_PORT}/health" || exit 1
+  CMD curl -fsS "http://127.0.0.1:${DOT_API_PORT}/readyz" || exit 1
 
 ENTRYPOINT ["/app/entrypoint.sh"]

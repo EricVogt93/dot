@@ -101,7 +101,9 @@ function safeEqual(a, b) {
 
 function authorized(req, url, apiKey = API_KEY) {
   if (!apiKey) return true;
-  if (url.pathname === "/health") return true;
+  if (url.pathname === "/health" || url.pathname === "/livez" || url.pathname === "/readyz") {
+    return true;
+  }
   const header = req.headers.authorization || "";
   const match = /^Bearer\s+(.+)$/i.exec(header);
   return Boolean(match && safeEqual(match[1], apiKey));
@@ -236,13 +238,14 @@ function parseLastJson(text) {
 }
 
 class AppServer {
-  constructor({ onReset } = {}) {
-    this.onReset = onReset || (() => {});
+  constructor({ onInvalidate } = {}) {
+    this.onInvalidate = onInvalidate || (() => {});
     this.child = null;
+    this.generation = 0; // monotonic per spawn; old events must not touch new state
     this.initialized = false;
     this.buffer = "";
     this.nextId = 1;
-    this.pending = new Map();
+    this.pending = new Map(); // id -> {resolve, reject, timer, generation}
     this.listeners = new Map();
     this.starting = null;
     this.shuttingDown = false;
@@ -251,6 +254,7 @@ class AppServer {
   }
 
   async start() {
+    if (this.shuttingDown) throw httpError(502, "app-server is shutting down");
     if (this.child && this.initialized) return;
     if (this.starting) return this.starting;
     this.starting = this._spawnAndInitialize().finally(() => {
@@ -266,40 +270,45 @@ class AppServer {
       "stdio://",
       ...(ANALYTICS ? ["--analytics-default-enabled"] : []),
     ];
-    const child = spawn(CODEX_BIN, args, {
-      env: { ...process.env, CODEX_HOME },
-      stdio: ["pipe", "pipe", "pipe"],
-    });
+    const generation = ++this.generation;
+    let child;
+    try {
+      child = spawn(CODEX_BIN, args, {
+        env: { ...process.env, CODEX_HOME },
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+    } catch (error) {
+      // spawn can throw synchronously; no exit event is guaranteed then.
+      throw httpError(502, `app-server spawn failed: ${error.message}`);
+    }
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
 
     this.child = child;
     this.initialized = false;
     this.buffer = "";
+    this.nextId = 1;
 
-    child.stdout.on("data", (chunk) => this._onData(chunk));
+    const ownsChild = () => this.child === child && this.generation === generation;
+    child.stdout.on("data", (chunk) => {
+      if (ownsChild()) this._onData(chunk);
+    });
     child.stderr.on("data", (chunk) => {
       const text = chunk.trim();
       if (text) log(`app-server stderr: ${text.slice(-2000)}`);
     });
-    child.on("error", (error) => {
-      log(`app-server spawn error: ${error.message}`);
+    child.stdin.on("error", (error) => {
+      if (ownsChild()) {
+        this._invalidate(child, httpError(502, `app-server stdin error: ${error.message}`));
+      }
     });
-    child.on("exit", (code, signal) => {
+    child.on("error", (error) => {
+      this._invalidate(child, httpError(502, `app-server spawn error: ${error.message}`));
+    });
+    child.on("close", (code, signal) => {
+      if (!ownsChild()) return; // stale exit of an already replaced child
       log(`app-server exited code=${code} signal=${signal}`);
-      if (this.child === child) {
-        this.child = null;
-        this.initialized = false;
-        this.buffer = "";
-      }
-      for (const { reject, timer } of this.pending.values()) {
-        clearTimeout(timer);
-        reject(new Error("app-server exited"));
-      }
-      this.pending.clear();
-      this.onReset();
-      this._emit("server/exited", { code, signal });
-      this._scheduleRestart();
+      this._invalidate(child, httpError(502, "app-server exited"));
     });
 
     try {
@@ -318,21 +327,47 @@ class AppServer {
         },
         30_000,
         true,
+        generation,
       );
+      if (!ownsChild()) throw httpError(502, "app-server exited during initialization");
       this._send({ jsonrpc: "2.0", method: "initialized", params: {} });
       this.initialized = true;
       this.restartDelay = 1000;
-      this.onReset();
       log(`app-server initialized: ${response.userAgent}`);
+      cacheVersionAtStart().catch(() => {});
     } catch (error) {
-      if (this.child === child) {
-        this.child = null;
-        this.initialized = false;
-        this.buffer = "";
-      }
-      child.kill("SIGKILL");
+      this._invalidate(child, error);
       throw error;
     }
+  }
+
+  // Single invalidation path: only the currently owned child, only once.
+  // Rejects pending RPCs, drops parser state, invalidates thread owners,
+  // emits server/exited, kills the child if needed and schedules a restart.
+  _invalidate(child, error) {
+    if (this.child !== child) return;
+    this.child = null;
+    this.initialized = false;
+    this.buffer = "";
+    const failure = error instanceof Error ? error : new Error(String(error));
+    for (const { reject, timer } of this.pending.values()) {
+      clearTimeout(timer);
+      reject(failure);
+    }
+    this.pending.clear();
+    this.onInvalidate(this.generation);
+    this._emit("server/exited", { message: failure.message });
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      // already dead
+    }
+    this._scheduleRestart();
+  }
+
+  // Invalidate the current child from outside (unrecoverable turn states).
+  invalidate(error) {
+    if (this.child) this._invalidate(this.child, error);
   }
 
   _scheduleRestart() {
@@ -351,9 +386,13 @@ class AppServer {
   _send(message) {
     const child = this.child;
     if (!child || !child.stdin.writable) {
-      throw new Error("app-server is not running");
+      throw httpError(502, "app-server is not running");
     }
-    child.stdin.write(`${JSON.stringify(message)}\n`);
+    child.stdin.write(`${JSON.stringify(message)}\n`, (error) => {
+      if (error && this.child === child) {
+        this._invalidate(child, httpError(502, `app-server write failed: ${error.message}`));
+      }
+    });
   }
 
   _onData(chunk) {
@@ -371,9 +410,12 @@ class AppServer {
     }
     if (this.buffer.length > MAX_RPC_BUFFER_BYTES) {
       log(
-        `dropping oversized app-server line (${this.buffer.length} bytes > ${MAX_RPC_BUFFER_BYTES})`,
+        `oversized app-server line (${this.buffer.length} bytes > ${MAX_RPC_BUFFER_BYTES}); invalidating`,
       );
       this.buffer = "";
+      if (this.child) {
+        this._invalidate(this.child, httpError(502, "app-server output overflow"));
+      }
     }
   }
 
@@ -426,18 +468,23 @@ class AppServer {
   }
 
   _replyToServerRequest(message) {
-    const { id, method } = message;
+    const { id, method, params } = message;
     let response;
     if (
-      method === "execCommandApproval" ||
-      method === "applyPatchApproval"
+      method === "item/commandExecution/requestApproval" ||
+      method === "item/fileChange/requestApproval"
     ) {
-      response = { jsonrpc: "2.0", id, result: { decision: "approved" } };
-    } else if (method === "fileChangeRequestApproval") {
-      response = { jsonrpc: "2.0", id, result: { decision: "accept" } };
-    } else if (method === "toolRequestUserInput") {
+      // V2 approvals (Codex 0.167.0 schema): decision accept/decline/cancel.
+      // Only the fully automatic container configuration approves; there is
+      // no human approval surface, so humanCommand is always declined. No
+      // session-scoped or policy-amending decisions are ever returned.
+      const automatic = APPROVAL_POLICY === "never" && SANDBOX === "danger-full-access";
+      const humanCommand = params && params.kind === "humanCommand";
+      const decision = automatic && !humanCommand ? "accept" : "decline";
+      response = { jsonrpc: "2.0", id, result: { decision } };
+    } else if (method === "item/tool/requestUserInput") {
       response = { jsonrpc: "2.0", id, result: { answers: {} } };
-    } else if (method === "permissionsRequestApproval") {
+    } else if (method === "item/permissions/requestApproval") {
       // The container grants the sandbox it was started with; deny ad-hoc
       // permission escalations instead of silently widening it.
       response = {
@@ -472,22 +519,41 @@ class AppServer {
     };
   }
 
-  async request(method, params, timeoutMs = 30_000, allowBeforeInit = false) {
+  async request(
+    method,
+    params,
+    timeoutMs = 30_000,
+    allowBeforeInit = false,
+    expectedGeneration = null,
+  ) {
+    const checkGeneration = () => {
+      if (expectedGeneration !== null && this.generation !== expectedGeneration) {
+        throw httpError(502, "app-server restarted; retry request");
+      }
+    };
+    checkGeneration();
     if (!allowBeforeInit) {
       await this.start();
+      checkGeneration();
     }
+    const generation = this.generation;
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        this.pending.delete(id);
-        reject(new Error(`app-server ${method} timed out after ${timeoutMs}ms`));
+        const entry = this.pending.get(id);
+        if (entry && entry.generation === generation) {
+          this.pending.delete(id);
+          reject(new Error(`app-server ${method} timed out after ${timeoutMs}ms`));
+        }
       }, timeoutMs);
-      this.pending.set(id, { resolve, reject, timer });
+      this.pending.set(id, { resolve, reject, timer, generation });
       try {
         this._send({ jsonrpc: "2.0", id, method, params });
       } catch (error) {
         clearTimeout(timer);
-        this.pending.delete(id);
+        if (this.pending.get(id)?.generation === generation) {
+          this.pending.delete(id);
+        }
         reject(error);
       }
     });
@@ -496,16 +562,23 @@ class AppServer {
   async stop() {
     this.shuttingDown = true;
     clearTimeout(this.restartTimer);
+    this.restartTimer = null;
     const child = this.child;
     if (!child) return;
-    child.stdin.end();
+    // Reject outstanding work; no restart may happen during shutdown.
+    this._invalidate(child, httpError(502, "app-server shutting down"));
+    try {
+      child.stdin.end();
+    } catch {
+      // already closed
+    }
     child.kill("SIGTERM");
     await new Promise((resolve) => {
       const timer = setTimeout(() => {
         child.kill("SIGKILL");
         resolve();
       }, 3000);
-      child.once("exit", () => {
+      child.once("close", () => {
         clearTimeout(timer);
         resolve();
       });
@@ -517,27 +590,32 @@ class AppServer {
 // Conversation & Turn management
 // ---------------------------------------------------------------------------
 
-const conversations = new Map(); // conversationId -> {threadId, developerInstructions, model, queue}
+const conversations = new Map(); // conversationId -> entry {threadId, generation, users, queue, ...}
 const pendingThreads = new Map(); // conversationId -> Promise<entry>
-const activeTurns = new Map(); // threadId -> turnId
+const activeTurns = new Map(); // threadId -> {turnId, generation, cancel}
+
+function invalidateConversationState(generation) {
+  for (const [key, entry] of conversations) {
+    if (entry.generation === generation) conversations.delete(key);
+  }
+  for (const [threadId, active] of activeTurns) {
+    if (active.generation === generation) activeTurns.delete(threadId);
+  }
+}
 
 const appServer = new AppServer({
-  onReset() {
-    conversations.clear();
-    pendingThreads.clear();
-    activeTurns.clear();
-  },
+  onInvalidate: invalidateConversationState,
 });
 
-function validateCwd(requested) {
-  if (!requested) return WORKSPACE;
+function validateCwd(requested, workspace = WORKSPACE) {
+  if (!requested) return workspace;
   if (typeof requested !== "string" || requested.includes("\0")) {
     throw httpError(400, "cwd must be a valid path string");
   }
   const resolved = path.resolve(requested);
-  const root = WORKSPACE.endsWith(path.sep) ? WORKSPACE : WORKSPACE + path.sep;
-  if (resolved !== WORKSPACE && !resolved.startsWith(root)) {
-    throw httpError(400, `cwd must be inside ${WORKSPACE}`);
+  const root = workspace.endsWith(path.sep) ? workspace : workspace + path.sep;
+  if (resolved !== workspace && !resolved.startsWith(root)) {
+    throw httpError(400, `cwd must be inside ${workspace}`);
   }
   return resolved;
 }
@@ -579,25 +657,74 @@ function normalizeMessages(body) {
 }
 
 function conversationIdFor(body, req) {
-  return String(
-    body.conversation_id ||
-      (body.metadata && body.metadata.conversation_id) ||
-      req.headers["x-conversation-id"] ||
-      body.user ||
-      "default",
-  );
+  const candidates = [
+    body.conversation_id,
+    body.metadata && body.metadata.conversation_id,
+    req.headers["x-conversation-id"],
+    body.user,
+  ];
+  for (const candidate of candidates) {
+    if (candidate === undefined || candidate === null) continue;
+    if (typeof candidate !== "string" || candidate.length === 0) {
+      throw httpError(400, "conversation id must be a non-empty string");
+    }
+    return candidate;
+  }
+  // No explicit identifier: every request gets its own conversation instead
+  // of silently sharing one hidden "default" thread.
+  return randomUUID();
+}
+
+// Explicit configuration must match an existing conversation; omitted
+// fields inherit the entry configuration. Conflicts are never ignored.
+function checkConversationConfig(entry, body, system) {
+  const conflict = () =>
+    httpError(409, "conversation configuration conflict; use a new conversation_id");
+  if (body.cwd !== undefined && body.cwd !== null && body.cwd !== "") {
+    if (validateCwd(body.cwd) !== entry.cwd) throw conflict();
+  }
+  if (system && system !== entry.developerInstructions) throw conflict();
+  if (body.model) {
+    if (body.model !== entry.requestedModel && body.model !== entry.model) {
+      throw conflict();
+    }
+  }
 }
 
 function evictOldestConversations() {
   if (conversations.size < MAX_CONVERSATIONS) return;
   for (const [key, entry] of conversations) {
     if (conversations.size < MAX_CONVERSATIONS) break;
-    if (activeTurns.has(entry.threadId)) continue;
+    // Never evict an entry with waiting or running requests.
+    if (entry.users > 0 || activeTurns.has(entry.threadId)) continue;
     conversations.delete(key);
   }
 }
 
-async function createThread(conversationId, body) {
+// Abort-aware wait: a disconnecting client stops waiting immediately, but
+// shared work (thread creation) is never cancelled on its behalf.
+function awaitWithSignal(promise, signal) {
+  if (!signal) return promise;
+  if (signal.aborted) {
+    return Promise.reject(httpError(499, "client disconnected"));
+  }
+  return new Promise((resolve, reject) => {
+    const onAbort = () => reject(httpError(499, "client disconnected"));
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
+async function createThread(conversationId, body, generation) {
   const { system } = normalizeMessages(body);
   const cwd = validateCwd(body.cwd);
   const params = {
@@ -610,17 +737,33 @@ async function createThread(conversationId, body) {
   if (model) params.model = model;
   if (system) params.developerInstructions = system;
 
-  const response = await appServer.request("thread/start", params, 60_000);
+  const response = await appServer.request(
+    "thread/start",
+    params,
+    60_000,
+    false,
+    generation,
+  );
   const threadId = response?.thread?.id;
   if (!threadId) throw new Error("thread/start returned no thread id");
 
   const entry = {
     threadId,
+    generation,
     developerInstructions: system,
-    model: model || null,
+    // Actual configuration reported by thread/start, plus the requested
+    // model for alias comparisons.
+    model: response.model || model || null,
+    requestedModel: model || null,
+    cwd: response.cwd || cwd,
+    users: 0,
     queue: Promise.resolve(),
   };
   if (THREAD_MODE !== "ephemeral") {
+    // Publish only while this generation is still the current one.
+    if (appServer.generation !== generation) {
+      throw httpError(502, "app-server restarted; retry request");
+    }
     evictOldestConversations();
     conversations.set(conversationId, entry);
   }
@@ -628,50 +771,84 @@ async function createThread(conversationId, body) {
   return entry;
 }
 
-async function getThread(conversationId, body) {
+async function getThread(conversationId, body, signal) {
+  // Validate messages and explicit configuration before any thread access.
+  const { system } = normalizeMessages(body);
+  validateCwd(body.cwd);
+  await awaitWithSignal(appServer.start(), signal);
+  const generation = appServer.generation;
   if (THREAD_MODE === "ephemeral") {
-    return createThread(conversationId, body);
+    return createThread(conversationId, body, generation);
   }
   const existing = conversations.get(conversationId);
-  if (existing) {
+  if (existing && existing.generation === generation) {
+    checkConversationConfig(existing, body, system);
     // Refresh insertion order for LRU eviction.
     conversations.delete(conversationId);
     conversations.set(conversationId, existing);
     return existing;
   }
   const inflight = pendingThreads.get(conversationId);
-  if (inflight) return inflight;
+  if (inflight) {
+    const entry = await awaitWithSignal(inflight, signal);
+    // Waiters behind a shared creation are checked against the same entry.
+    checkConversationConfig(entry, body, system);
+    return entry;
+  }
 
-  const promise = createThread(conversationId, body).finally(() => {
-    pendingThreads.delete(conversationId);
+  const promise = createThread(conversationId, body, generation).finally(() => {
+    // Only this promise may remove its own reservation.
+    if (pendingThreads.get(conversationId) === promise) {
+      pendingThreads.delete(conversationId);
+    }
   });
   pendingThreads.set(conversationId, promise);
-  return promise;
+  return awaitWithSignal(promise, signal);
 }
+
+// Interrupt recovery: after sending turn/interrupt the turn must reach a
+// terminal completion within this window, otherwise the child is invalid.
+const INTERRUPT_RECOVERY_MS = 10_000;
 
 function runTurn(entry, body, onDelta, signal, { accumulateText = true } = {}) {
   const { lastUser } = normalizeMessages(body);
   const run = async () => {
+    // Stale queue entries from a previous child generation never start work.
+    if (entry.generation !== appServer.generation) {
+      return { turnId: null, error: httpError(502, "app-server restarted; retry request"), text: "" };
+    }
+    if (signal?.aborted) {
+      return { turnId: null, error: httpError(499, "client disconnected"), text: "" };
+    }
+    const generation = entry.generation;
     let turnId = null;
     let delivered = "";
     let hasDelivered = false;
     let finished = false;
-    let aborted = false;
-    let timer = null;
+    let finalError = null;
+    let cancelReason = null; // {error} once a cancel was requested
+    let interruptSent = false;
+    let deadlineTimer = null;
+    let recoveryTimer = null;
     let resolveFinish;
     const finishedPromise = new Promise((resolve) => {
       resolveFinish = resolve;
     });
 
+    // Events arriving before the turn/start response are buffered and only
+    // applied once the confirmed turn id is known.
+    const preStartEvents = [];
+    let preStartBytes = 0;
+
     const unsubscribers = [];
     const cleanup = () => {
-      clearTimeout(timer);
+      clearTimeout(deadlineTimer);
+      clearTimeout(recoveryTimer);
       for (const off of unsubscribers) off();
       unsubscribers.length = 0;
       if (signal) signal.removeEventListener("abort", onAbort);
-      if (turnId && activeTurns.get(entry.threadId) === turnId) {
-        activeTurns.delete(entry.threadId);
-      }
+      const active = activeTurns.get(entry.threadId);
+      if (active && active.cancel === cancel) activeTurns.delete(entry.threadId);
     };
 
     const done = (error) => {
@@ -681,32 +858,57 @@ function runTurn(entry, body, onDelta, signal, { accumulateText = true } = {}) {
       resolveFinish({ error: error || null });
     };
 
-    function onAbort() {
-      aborted = true;
-      if (!turnId) return; // interrupt after turn/start returns
+    const sendInterrupt = () => {
+      if (interruptSent || !turnId) return;
+      interruptSent = true;
       appServer
-        .request("turn/interrupt", { threadId: entry.threadId, turnId }, 10_000)
-        .catch(() => {});
-      done(new Error("client disconnected"));
+        .request(
+          "turn/interrupt",
+          { threadId: entry.threadId, turnId },
+          10_000,
+          false,
+          generation,
+        )
+        .catch((error) => {
+          log(`turn/interrupt failed: ${error.message}`);
+        });
+      // Bounded recovery: without a terminal completion the child is invalid.
+      recoveryTimer = setTimeout(() => {
+        if (!finished) {
+          appServer.invalidate(httpError(502, "interrupted turn did not complete; restarting app-server"));
+        }
+      }, INTERRUPT_RECOVERY_MS);
+    };
+
+    // Single cancel path for client disconnect, /v1/interrupt and timeout.
+    // Resolves only when the turn reached a safe end.
+    const cancel = (error) => {
+      if (finished) return finishedPromise;
+      if (!cancelReason) cancelReason = { error };
+      if (turnId) sendInterrupt();
+      // Before the start response: remember the cancel; it is applied as
+      // soon as the turn id is confirmed.
+      return finishedPromise;
+    };
+
+    function onAbort() {
+      cancel(httpError(499, "client disconnected"));
     }
 
-    // Subscribe before turn/start: a fast turn can complete before the RPC
-    // response is processed.
-    unsubscribers.push(
-      appServer.on("item/agentMessage/delta", (params) => {
-        if (params.threadId !== entry.threadId) return;
-        if (turnId && params.turnId && params.turnId !== turnId) return;
+    const applyEvent = (method, params) => {
+      if (method === "item/agentMessage/delta") {
+        if (params.threadId !== entry.threadId || params.turnId !== turnId) return;
         if (typeof params.delta === "string") {
           hasDelivered = true;
           if (accumulateText) delivered += params.delta;
           onDelta(params.delta);
         }
-      }),
-      appServer.on("turn/completed", (params) => {
+        return;
+      }
+      if (method === "turn/completed") {
         if (params.threadId !== entry.threadId) return;
         const completed = params.turn || {};
-        if (turnId && completed.id && completed.id !== turnId) return;
-        if (!turnId && completed.id) turnId = completed.id;
+        if (completed.id !== turnId) return;
         if (!completed.error && !hasDelivered) {
           const items = Array.isArray(completed.items) ? completed.items : [];
           for (const item of items) {
@@ -717,19 +919,71 @@ function runTurn(entry, body, onDelta, signal, { accumulateText = true } = {}) {
             }
           }
         }
-        done(completed.error || null);
-      }),
-      appServer.on("error", (params) => {
-        if (params?.threadId && params.threadId !== entry.threadId) return;
-        if (turnId && params?.turnId && params.turnId !== turnId) return;
-        done(new Error(params?.message || params?.error || "turn failed"));
-      }),
-      appServer.on("server/exited", () => {
-        done(new Error("app-server exited during turn"));
+        // Terminal status decides the outcome (TurnStatus in the pinned
+        // schema): only "completed" without error succeeds.
+        if (completed.status === "completed" && !completed.error) {
+          done(cancelReason ? cancelReason.error : finalError);
+        } else if (completed.status === "interrupted") {
+          done(cancelReason ? cancelReason.error : httpError(409, "turn interrupted"));
+        } else if (completed.status === "failed") {
+          done(httpError(502, errorMessage(completed.error, "turn failed")));
+        } else {
+          done(
+            httpError(
+              502,
+              `app-server protocol error: unexpected terminal turn status ${JSON.stringify(completed.status)}`,
+            ),
+          );
+        }
+        return;
+      }
+      if (method === "error") {
+        if (params?.threadId !== entry.threadId || params?.turnId !== turnId) return;
+        const message = errorMessage(params?.error, "turn failed");
+        if (params?.willRetry) {
+          // Codex is retrying internally; keep listening for the real
+          // terminal completion instead of failing the HTTP request.
+          log(`app-server error (will retry): ${message}`);
+          return;
+        }
+        finalError = httpError(502, message);
+      }
+    };
+
+    const handleTurnEvent = (method, params) => {
+      if (finished) return;
+      if (params?.threadId && params.threadId !== entry.threadId) return;
+      if (!turnId) {
+        const size = JSON.stringify(params).length;
+        if (preStartBytes + size > MAX_RPC_BUFFER_BYTES) {
+          appServer.invalidate(httpError(502, "app-server event buffer overflow before turn start"));
+          return;
+        }
+        preStartBytes += size;
+        preStartEvents.push({ method, params });
+        return;
+      }
+      applyEvent(method, params);
+    };
+
+    // Subscribe before turn/start: a fast turn can complete before the RPC
+    // response is processed.
+    unsubscribers.push(
+      appServer.on("item/agentMessage/delta", (params) => handleTurnEvent("item/agentMessage/delta", params)),
+      appServer.on("turn/completed", (params) => handleTurnEvent("turn/completed", params)),
+      appServer.on("error", (params) => handleTurnEvent("error", params)),
+      appServer.on("server/exited", (params) => {
+        done(httpError(502, params?.message || "app-server exited during turn"));
       }),
     );
 
     if (signal) signal.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) onAbort();
+
+    // The turn deadline starts at queue start and covers turn/start.
+    deadlineTimer = setTimeout(() => {
+      cancel(httpError(504, "turn timed out"));
+    }, TURN_TIMEOUT_MS);
 
     let response;
     try {
@@ -739,30 +993,31 @@ function runTurn(entry, body, onDelta, signal, { accumulateText = true } = {}) {
           threadId: entry.threadId,
           input: [{ type: "text", text: lastUser }],
         },
-        60_000,
+        Math.min(60_000, TURN_TIMEOUT_MS),
+        false,
+        generation,
       );
     } catch (error) {
       done(error);
-      throw error;
+      const result = await finishedPromise;
+      return { turnId, error: result.error, text: delivered };
     }
 
     const startedTurnId = response?.turn?.id;
-    if (!turnId) turnId = startedTurnId || null;
-    if (!finished) {
-      if (turnId) activeTurns.set(entry.threadId, turnId);
-      timer = setTimeout(() => {
-        appServer
-          .request(
-            "turn/interrupt",
-            { threadId: entry.threadId, turnId },
-            10_000,
-          )
-          .catch(() => {});
-        done(new Error(`turn timed out after ${TURN_TIMEOUT_MS}ms`));
-      }, TURN_TIMEOUT_MS);
+    if (!startedTurnId) {
+      // Unresolvable start: never leave agent work running unowned.
+      appServer.invalidate(httpError(502, "turn/start returned no turn id"));
+      done(httpError(502, "turn/start returned no turn id"));
+      const result = await finishedPromise;
+      return { turnId, error: result.error, text: delivered };
     }
-    if (aborted && !finished) {
-      onAbort();
+    if (!finished) {
+      turnId = startedTurnId;
+      activeTurns.set(entry.threadId, { turnId, generation, cancel });
+      const buffered = preStartEvents.splice(0);
+      preStartBytes = 0;
+      for (const event of buffered) applyEvent(event.method, event.params);
+      if (cancelReason && !finished) sendInterrupt();
     }
 
     const result = await finishedPromise;
@@ -776,7 +1031,9 @@ function runTurn(entry, body, onDelta, signal, { accumulateText = true } = {}) {
     () => undefined,
     () => undefined,
   );
-  return queued;
+  // A waiter that disconnects while queued gets an immediate error; run()
+  // still checks the signal at queue start so no turn is ever started.
+  return signal ? awaitWithSignal(queued, signal) : queued;
 }
 
 // ---------------------------------------------------------------------------
@@ -797,59 +1054,67 @@ async function readAuth() {
     const raw = await readFile(path.join(CODEX_HOME, "auth.json"), "utf8");
     const data = JSON.parse(raw);
     const tokens = data.tokens || {};
+    const apiKey = data.OPENAI_API_KEY || process.env.OPENAI_API_KEY || null;
+    const accessToken = tokens.access_token || null;
     return {
-      loggedIn: data.auth_mode === "chatgpt" || Boolean(data.OPENAI_API_KEY),
-      authMode: data.auth_mode || (data.OPENAI_API_KEY ? "apiKey" : null),
+      // Auth configuration means usable credentials, not just auth_mode.
+      // This does not validate tokens online.
+      loggedIn: Boolean(apiKey || accessToken),
+      authMode: data.auth_mode || (apiKey ? "apiKey" : null),
       accountId: tokens.account_id || null,
-      accessToken: tokens.access_token || null,
-      apiKey: data.OPENAI_API_KEY || null,
+      accessToken,
+      apiKey,
     };
   } catch {
+    const apiKey = process.env.OPENAI_API_KEY || null;
     return {
-      loggedIn: false,
-      authMode: null,
+      loggedIn: Boolean(apiKey),
+      authMode: apiKey ? "apiKey" : null,
       accountId: null,
       accessToken: null,
-      apiKey: null,
+      apiKey,
     };
   }
 }
 
+// Remote-control state comes exclusively from the worker's atomic status
+// file. "connected" requires a fresh checkedAt (<= 90 s, not in the future);
+// a running daemon alone never implies connectivity.
+const REMOTE_STATUS_MAX_AGE_MS = 90_000;
+
 async function readRemoteStatus() {
+  let data;
   try {
     const raw = await readFile(
       path.join(CODEX_HOME, "dot-remote-status.json"),
       "utf8",
     );
-    const data = JSON.parse(raw);
-    return {
-      connected: data.status === "connected",
-      status: data.status || "unknown",
-      serverName: data.serverName || null,
-      environmentId: data.environmentId || null,
-    };
+    data = JSON.parse(raw);
+    if (!data || typeof data !== "object") throw new Error("invalid status file");
   } catch {
-    // Fall through to the daemon check.
-  }
-  try {
-    const { stdout } = await runCodex(["app-server", "daemon", "version"], 5000);
-    const data = JSON.parse(stdout.trim());
-    return {
-      connected:
-        data.status === "running" && data.appServerVersion === data.cliVersion,
-      status: data.status === "running" ? "running" : data.status || "unknown",
-      serverName: null,
-      environmentId: null,
-    };
-  } catch (error) {
     return {
       connected: false,
       status: "unknown",
       serverName: null,
       environmentId: null,
-      error: error.message,
+      checkedAt: null,
     };
   }
+  const checkedAt = typeof data.checkedAt === "string" ? data.checkedAt : null;
+  const checkedAtMs = checkedAt ? Date.parse(checkedAt) : NaN;
+  const now = Date.now();
+  const fresh =
+    Number.isFinite(checkedAtMs) &&
+    checkedAtMs <= now &&
+    now - checkedAtMs <= REMOTE_STATUS_MAX_AGE_MS;
+  const status = data.status || "unknown";
+  return {
+    connected: status === "connected" && fresh,
+    status: status === "connected" && !fresh ? "stale" : status,
+    serverName: data.serverName || null,
+    environmentId: data.environmentId || null,
+    checkedAt,
+  };
 }
 
 let cachedVersion = null;
@@ -868,14 +1133,59 @@ async function codexVersion() {
   }
 }
 
+// Determined once per successful app-server start; probes never spawn CLI
+// subprocesses.
+let versionAtStart = null;
+async function cacheVersionAtStart() {
+  try {
+    const { stdout } = await runCodex(["--version"], 5000);
+    versionAtStart = stdout.trim() || null;
+  } catch {
+    versionAtStart = null;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Route handlers
 // ---------------------------------------------------------------------------
 
+// Abort the request when the client goes away before the response finished
+// normally. The same signal drives thread acquisition and the turn queue.
+function requestAbort(req, res) {
+  const controller = new AbortController();
+  const onGone = () => {
+    if (!res.writableEnded) controller.abort();
+  };
+  req.on("aborted", onGone);
+  res.on("close", onGone);
+  return {
+    signal: controller.signal,
+    dispose() {
+      req.off("aborted", onGone);
+      res.off("close", onGone);
+    },
+  };
+}
+
 async function handleChatCompletions(req, res, body) {
   const conversationId = conversationIdFor(body, req);
-  const entry = await getThread(conversationId, body);
-  const model = body.model || entry.model || MODEL || "codex";
+  const abort = requestAbort(req, res);
+  let entry;
+  try {
+    entry = await getThread(conversationId, body, abort.signal);
+  } catch (error) {
+    abort.dispose();
+    throw error;
+  }
+  if (abort.signal.aborted) {
+    abort.dispose();
+    throw httpError(499, "client disconnected");
+  }
+  entry.users += 1;
+  const releaseEntry = () => {
+    entry.users -= 1;
+  };
+  const model = entry.model || MODEL || "codex";
   const id = `chatcmpl-${randomUUID()}`;
   const created = Math.floor(Date.now() / 1000);
 
@@ -885,6 +1195,7 @@ async function handleChatCompletions(req, res, body) {
       "Cache-Control": "no-cache, no-transform",
       Connection: "keep-alive",
       "X-Accel-Buffering": "no",
+      "X-Conversation-Id": conversationId,
     });
     const write = (payload) => {
       if (!res.writableEnded) res.write(`data: ${JSON.stringify(payload)}\n\n`);
@@ -901,16 +1212,14 @@ async function handleChatCompletions(req, res, body) {
     const ping = setInterval(() => {
       if (!res.writableEnded) res.write(": ping\n\n");
     }, 15_000);
-    const controller = new AbortController();
-    const onClose = () => controller.abort();
-    res.on("close", onClose);
+    // The abort controller created before getThread also covers the stream.
 
     try {
       const result = await runTurn(
         entry,
         body,
         (delta) => write(chunk({ content: delta })),
-        controller.signal,
+        abort.signal,
         { accumulateText: false },
       );
       if (result.error) {
@@ -922,7 +1231,8 @@ async function handleChatCompletions(req, res, body) {
       write({ error: { message: errorMessage(error) } });
     } finally {
       clearInterval(ping);
-      res.off("close", onClose);
+      abort.dispose();
+      releaseEntry();
       if (!res.writableEnded) {
         res.write("data: [DONE]\n\n");
         res.end();
@@ -931,52 +1241,89 @@ async function handleChatCompletions(req, res, body) {
     return;
   }
 
-  const result = await runTurn(entry, body, () => {});
-  if (result.error) {
-    throw httpError(502, errorMessage(result.error));
+  try {
+    const result = await runTurn(entry, body, () => {}, abort.signal);
+    if (result.error) {
+      throw httpError(result.error.statusCode || 502, errorMessage(result.error));
+    }
+    sendJson(res, 200, {
+      id,
+      object: "chat.completion",
+      created,
+      model,
+      choices: [
+        {
+          index: 0,
+          message: { role: "assistant", content: result.text },
+          finish_reason: "stop",
+        },
+      ],
+      conversation_id: conversationId,
+      thread_id: entry.threadId,
+    });
+  } finally {
+    abort.dispose();
+    releaseEntry();
   }
-  sendJson(res, 200, {
-    id,
-    object: "chat.completion",
-    created,
-    model,
-    choices: [
-      {
-        index: 0,
-        message: { role: "assistant", content: result.text },
-        finish_reason: "stop",
-      },
-    ],
-    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-    conversation_id: conversationId,
-    thread_id: entry.threadId,
-  });
 }
 
 async function handleSimpleChat(req, res, body) {
   const conversationId = conversationIdFor(body, req);
-  const entry = await getThread(conversationId, body);
-  const result = await runTurn(entry, body, () => {});
-  if (result.error) {
-    throw httpError(502, errorMessage(result.error));
+  const abort = requestAbort(req, res);
+  let entry;
+  try {
+    entry = await getThread(conversationId, body, abort.signal);
+  } catch (error) {
+    abort.dispose();
+    throw error;
   }
-  sendJson(res, 200, {
-    reply: result.text,
-    thread_id: entry.threadId,
-    conversation_id: conversationId,
-  });
+  entry.users += 1;
+  try {
+    if (abort.signal.aborted) throw httpError(499, "client disconnected");
+    const result = await runTurn(entry, body, () => {}, abort.signal);
+    if (result.error) {
+      throw httpError(result.error.statusCode || 502, errorMessage(result.error));
+    }
+    sendJson(res, 200, {
+      reply: result.text,
+      thread_id: entry.threadId,
+      conversation_id: conversationId,
+    });
+  } finally {
+    entry.users -= 1;
+    abort.dispose();
+  }
+}
+
+function appServerReady() {
+  return Boolean(appServer.child && appServer.initialized && !appServer.shuttingDown);
+}
+
+// Liveness: the HTTP process serves requests. No file, CLI or network work.
+async function handleLivez(req, res) {
+  sendJson(res, 200, { ok: true });
+}
+
+// Readiness: initialized app-server plus auth configuration. Remote control
+// and Dots are separate features and never block an otherwise usable chat.
+async function handleReadyz(req, res) {
+  const auth = await readAuth();
+  const ready = appServerReady() && auth.loggedIn;
+  sendJson(res, ready ? 200 : 503, { ready });
 }
 
 async function handleHealth(req, res) {
-  const [auth, remote, version, installationId] = await Promise.all([
+  const [auth, remote, installationId] = await Promise.all([
     readAuth(),
     readRemoteStatus(),
-    codexVersion(),
     readInstallationId(),
   ]);
+  const ready = appServerReady() && auth.loggedIn;
   sendJson(res, 200, {
     ok: true,
-    codex: { version, bin: CODEX_BIN },
+    ready,
+    appServer: { ready: appServerReady() },
+    codex: { version: versionAtStart || (await codexVersion()), bin: CODEX_BIN },
     auth: {
       loggedIn: auth.loggedIn,
       authMode: auth.authMode,
@@ -1048,12 +1395,17 @@ async function handleInterrupt(req, res, body) {
   if (!threadId || typeof threadId !== "string") {
     throw httpError(400, "thread_id is required");
   }
-  const turnId = activeTurns.get(threadId);
-  if (!turnId) {
+  const active = activeTurns.get(threadId);
+  if (!active) {
     throw httpError(404, "no active turn for that thread");
   }
-  await appServer.request("turn/interrupt", { threadId, turnId }, 10_000);
-  sendJson(res, 200, { ok: true, thread_id: threadId, turn_id: turnId });
+  // Same cancel path as client aborts; respond only after the turn reached
+  // a safe terminal end.
+  const result = await active.cancel(httpError(409, "turn interrupted"));
+  if (result.error && result.error.statusCode !== 409) {
+    throw httpError(result.error.statusCode || 502, errorMessage(result.error));
+  }
+  sendJson(res, 200, { ok: true, thread_id: threadId, turn_id: active.turnId });
 }
 
 // ---------------------------------------------------------------------------
@@ -1081,6 +1433,7 @@ const server = createServer(async (req, res) => {
     }
     if (corsOrigin) {
       res.setHeader("Access-Control-Allow-Origin", corsOrigin);
+      res.setHeader("Access-Control-Expose-Headers", "X-Conversation-Id");
       res.setHeader("Vary", "Origin");
     }
 
@@ -1101,6 +1454,14 @@ const server = createServer(async (req, res) => {
 
     if (req.method === "GET" && url.pathname === "/health") {
       await handleHealth(req, res);
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/livez") {
+      await handleLivez(req, res);
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/readyz") {
+      await handleReadyz(req, res);
       return;
     }
     if (req.method === "GET" && url.pathname === "/v1/models") {
@@ -1172,7 +1533,9 @@ function start() {
     );
   }
   server.listen(PORT, BIND, () => {
-    log(`listening on ${BIND}:${PORT} workspace=${WORKSPACE} codex=${CODEX_BIN}`);
+    const address = server.address();
+    const boundPort = address && typeof address === "object" ? address.port : PORT;
+    log(`listening on ${BIND}:${boundPort} workspace=${WORKSPACE} codex=${CODEX_BIN}`);
     appServer.start().catch((error) => {
       log(`initial app-server start failed: ${error.message}`);
     });

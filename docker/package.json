@@ -8,8 +8,12 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test test/",
-    "lint": "node --check server.js && bash -n entrypoint.sh && bash -n dots-executor.sh"
+    "test": "node --test test/helpers.test.js test/bridge.test.js test/lifecycle.test.js test/supervisor.test.js",
+    "test:unit": "node --test test/helpers.test.js",
+    "test:bridge": "node --test test/bridge.test.js test/lifecycle.test.js",
+    "test:supervisor": "node --test test/supervisor.test.js",
+    "test:image": "bash verify-image.sh",
+    "lint": "node --check server.js && bash -n entrypoint.sh && bash -n dots-executor.sh && bash -n remote-control.sh"
   },
   "engines": {
     "node": ">=22"

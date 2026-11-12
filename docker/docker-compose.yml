@@ -14,14 +14,15 @@ services:
     hostname: ${DOT_HOSTNAME:-dot-sandbox}
     init: true
     restart: unless-stopped
+    stop_grace_period: 30s
     ports:
       # Published on 127.0.0.1 only. Do not change to 0.0.0.0 without DOT_API_KEY.
       - "127.0.0.1:${DOT_PORT:-8787}:8787"
     volumes:
       - dot-data:/data
       - ${DOT_WORKSPACE_HOST:-./workspace}:/workspace
-      # Optional auth seed. Must point to an existing file; otherwise Docker
-      # creates an empty directory and the container falls back to device login.
+      # Optional auth seed. Must point to an existing file; an empty file
+      # enables device login. A directory mount is rejected at startup.
       - ${DOT_AUTH_FILE:-${HOME}/.codex/auth.json}:/seed/auth.json:ro
     environment:
       CODEX_HOME: /data/codex
@@ -42,7 +43,7 @@ services:
       DOT_DOTS_NAME: ${DOT_DOTS_NAME:-}
       DOT_DOTS_ATTACH: ${DOT_DOTS_ATTACH:-1}
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:$${DOT_API_PORT}/health || exit 1"]
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:$${DOT_API_PORT}/readyz || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3

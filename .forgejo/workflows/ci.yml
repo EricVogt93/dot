@@ -32,11 +32,14 @@ env:
 jobs:
   verify:
     runs-on: general
+    strategy:
+      matrix:
+        node: [22, 24]
     container:
-      image: node:24-bookworm-slim
+      image: node:${{ matrix.node }}-bookworm-slim
     steps:
       - name: Install tooling
-        run: apt-get update -qq && apt-get install -y -qq --no-install-recommends ca-certificates git
+        run: apt-get update -qq && apt-get install -y -qq --no-install-recommends bash ca-certificates coreutils curl git jq util-linux
       - name: Check out repository
         uses: https://data.forgejo.org/actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -48,8 +51,27 @@ jobs:
         working-directory: docker
         run: npm test
 
+  render:
+    runs-on: general
+    container:
+      image: node:24-bookworm-slim
+    steps:
+      - name: Install tooling
+        run: apt-get update -qq && apt-get install -y -qq --no-install-recommends ca-certificates curl git python3 python3-yaml
+      - name: Check out repository
+        uses: https://data.forgejo.org/actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install kubectl
+        run: |
+          curl -fsSLo /usr/local/bin/kubectl \
+            https://dl.k8s.io/release/v1.35.9/bin/linux/amd64/kubectl
+          chmod +x /usr/local/bin/kubectl
+      - name: Deployment render tests
+        run: python3 -m unittest discover -s deploy -p test_render.py
+
   image:
-    needs: verify
+    needs: [verify, render]
     runs-on: general
     container:
       image: docker:27-cli
@@ -58,9 +80,11 @@ jobs:
     env:
       REGISTRY_USER: ${{ vars.REGISTRY_USER }}
       REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+    outputs:
+      image_ref: ${{ steps.digest.outputs.image_ref }}
     steps:
       - name: Install action runtime
-        run: apk add --no-cache git nodejs
+        run: apk add --no-cache bash git nodejs
       - name: Check out repository
         uses: https://data.forgejo.org/actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -70,7 +94,7 @@ jobs:
         env:
           REPOSITORY: ${{ forgejo.repository }}
         run: |
-          echo "short_sha=$(git rev-parse --short=8 HEAD)" >> "$FORGEJO_OUTPUT"
+          echo "revision=$(git rev-parse HEAD)" >> "$FORGEJO_OUTPUT"
           if [ -n "$REGISTRY" ]; then
             echo "name=$REGISTRY/$REPOSITORY" >> "$FORGEJO_OUTPUT"
           else
@@ -79,19 +103,23 @@ jobs:
       - name: Build image
         env:
           IMAGE: ${{ steps.image.outputs.name }}
-          SHORT_SHA: ${{ steps.image.outputs.short_sha }}
+          REVISION: ${{ steps.image.outputs.revision }}
           SOURCE_URL: ${{ forgejo.server_url }}/${{ forgejo.repository }}
         run: |
           docker build --network=host \
             --build-arg "DOT_SOURCE_URL=$SOURCE_URL" \
-            --tag "$IMAGE:$SHORT_SHA" \
-            --tag "$IMAGE:latest" \
+            --tag "$IMAGE:$REVISION" \
             docker
+      - name: Verify built image (offline smoke, before any push)
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          REVISION: ${{ steps.image.outputs.revision }}
+        run: DOT_TEST_IMAGE="$IMAGE:$REVISION" bash docker/verify-image.sh
       - name: Push image
         if: forgejo.event_name == 'push'
         env:
           IMAGE: ${{ steps.image.outputs.name }}
-          SHORT_SHA: ${{ steps.image.outputs.short_sha }}
+          REVISION: ${{ steps.image.outputs.revision }}
           TARGET_REF: ${{ forgejo.ref }}
         run: |
           if [ -z "$REGISTRY" ]; then
@@ -101,14 +129,39 @@ jobs:
           : "${REGISTRY_USER:?Forgejo variable REGISTRY_USER is required}"
           : "${REGISTRY_TOKEN:?Forgejo secret REGISTRY_TOKEN is required}"
           printf '%s' "$REGISTRY_TOKEN" | docker login "$REGISTRY" --username "$REGISTRY_USER" --password-stdin
+          docker push "$IMAGE:$REVISION"
           if [ "$TARGET_REF" = "refs/heads/main" ]; then
-            docker push "$IMAGE:$SHORT_SHA"
+            docker tag "$IMAGE:$REVISION" "$IMAGE:latest"
             docker push "$IMAGE:latest"
           else
-            docker tag "$IMAGE:$SHORT_SHA" "$IMAGE:dev"
-            docker push "$IMAGE:$SHORT_SHA"
+            docker tag "$IMAGE:$REVISION" "$IMAGE:dev"
             docker push "$IMAGE:dev"
           fi
+      - name: Resolve registry digest of the built image
+        id: digest
+        if: forgejo.event_name == 'push'
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          REVISION: ${{ steps.image.outputs.revision }}
+        run: |
+          if [ -z "$REGISTRY" ]; then
+            echo "vars.REGISTRY is not set; no digest output (deploy stays disabled)"
+            exit 0
+          fi
+          # Exactly one RepoDigest must match this repository.
+          MATCHES="$(docker image inspect "$IMAGE:$REVISION" \
+            --format '{{range .RepoDigests}}{{println .}}{{end}}' \
+            | grep -F "$IMAGE@" || true)"
+          COUNT="$(printf '%s' "$MATCHES" | grep -c . || true)"
+          if [ "$COUNT" != "1" ]; then
+            echo "expected exactly one RepoDigest for $IMAGE, found $COUNT" >&2
+            exit 1
+          fi
+          case "$MATCHES" in
+            "$IMAGE@sha256:"????????????????????????????????????????????????????????????????) ;;
+            *) echo "unexpected digest format: $MATCHES" >&2; exit 1 ;;
+          esac
+          echo "image_ref=$MATCHES" >> "$FORGEJO_OUTPUT"
 
   deploy:
     needs: image
@@ -117,8 +170,7 @@ jobs:
     container:
       image: alpine:3.20
     env:
-      IMAGE: ${{ vars.REGISTRY }}/${{ forgejo.repository }}
-      FORGEJO_SHA: ${{ forgejo.sha }}
+      IMAGE_REF: ${{ needs.image.outputs.image_ref }}
       KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
       DEPLOY_KUSTOMIZATION: ${{ secrets.DEPLOY_KUSTOMIZATION }}
       DEPLOY_NAMESPACE: ${{ vars.DEPLOY_NAMESPACE }}
@@ -126,15 +178,15 @@ jobs:
       - name: Check deploy configuration
         id: config
         run: |
-          if [ -z "$REGISTRY" ] || [ -z "$KUBE_CONFIG" ] || [ -z "$DEPLOY_KUSTOMIZATION" ] || [ -z "$DEPLOY_NAMESPACE" ]; then
-            echo "deploy not configured (REGISTRY, KUBE_CONFIG, DEPLOY_KUSTOMIZATION, DEPLOY_NAMESPACE); skipping"
+          if [ -z "$REGISTRY" ] || [ -z "$IMAGE_REF" ] || [ -z "$KUBE_CONFIG" ] || [ -z "$DEPLOY_KUSTOMIZATION" ] || [ -z "$DEPLOY_NAMESPACE" ]; then
+            echo "deploy not configured (REGISTRY, image digest, KUBE_CONFIG, DEPLOY_KUSTOMIZATION, DEPLOY_NAMESPACE); skipping"
             echo "enabled=false" >> "$FORGEJO_OUTPUT"
           else
             echo "enabled=true" >> "$FORGEJO_OUTPUT"
           fi
       - name: Install action runtime
         if: steps.config.outputs.enabled == 'true'
-        run: apk add --no-cache ca-certificates curl git nodejs
+        run: apk add --no-cache ca-certificates curl git nodejs python3 py3-yaml
       - name: Check out repository
         if: steps.config.outputs.enabled == 'true'
         uses: https://data.forgejo.org/actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -153,14 +205,15 @@ jobs:
           printf '%s' "$KUBE_CONFIG" > /root/.kube/config
           chmod 600 /root/.kube/config
           printf '%s\n' "$DEPLOY_KUSTOMIZATION" > deploy/overlays/ci/kustomization.yaml
-      - name: Apply manifests
-        if: steps.config.outputs.enabled == 'true'
-        run: kubectl apply -k deploy/overlays/ci
-      - name: Set deployed image
+      - name: Render qualified manifests
         if: steps.config.outputs.enabled == 'true'
         run: |
-          SHORT_SHA="$(printf '%s' "$FORGEJO_SHA" | cut -c1-8)"
-          kubectl -n "$DEPLOY_NAMESPACE" set image deployment/dot "dot=$IMAGE:$SHORT_SHA"
+          # One fully determined manifest set: only the dot container image
+          # is replaced, by the exact digest built and verified in this run.
+          python3 deploy/render.py deploy/overlays/ci "$IMAGE_REF" > qualified.yaml
+      - name: Apply manifests
+        if: steps.config.outputs.enabled == 'true'
+        run: kubectl apply -f qualified.yaml
       - name: Wait for rollout
         if: steps.config.outputs.enabled == 'true'
         run: |
