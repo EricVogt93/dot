@@ -2,7 +2,7 @@ FROM node:24-bookworm-slim
 
 ARG DOT_VERSION=0.1.0
 ARG DOT_SOURCE_URL=""
-LABEL org.opencontainers.image.title="dot" \
+LABEL org.opencontainers.image.title="dotcker" \
       org.opencontainers.image.description="Codex app-server as a container: OpenAI-compatible chat API and ChatGPT remote-control device" \
       org.opencontainers.image.version="${DOT_VERSION}" \
       org.opencontainers.image.source="${DOT_SOURCE_URL}" \

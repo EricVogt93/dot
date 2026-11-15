@@ -1,6 +1,6 @@
 # Security policy
 
-dot exposes an agent with shell access through an HTTP API. Treat it as a
+dotcker exposes an agent with shell access through an HTTP API. Treat it as a
 remote-code-execution endpoint.
 
 ## Reporting a vulnerability

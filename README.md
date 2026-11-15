@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="docs/icon.png" alt="dot" width="140" />
+  <img src="docs/icon.png" alt="dotcker" width="140" />
 </p>
 
-<h1 align="center">dot</h1>
+<h1 align="center">dotcker</h1>
 
 <p align="center">
   Give ChatGPT / Dot (<b>"Your computer"</b> and <b>Codex remote control</b>) a clean, isolated container workspace on your PC or on a headless Linux server — plus a local HTTP bridge for health checks, pairing, and sandbox orchestration.
@@ -16,13 +16,13 @@
 >   without an Electron GUI) to your own ChatGPT / Dot agent, so the agent can
 >   work inside a dedicated `/workspace` instead of having unrestricted access
 >   to your host's home directory, SSH keys, and browser profiles.
-> - **No modified binaries, no paywall bypass:** `dot` ships zero proprietary
+> - **No modified binaries, no paywall bypass:** `dotcker` ships zero proprietary
 >   code. It installs and orchestrates the official, unmodified
 >   [OpenAI Codex CLI](https://github.com/openai/codex) (`codex`, Apache-2.0)
 >   and requires your own authenticated ChatGPT account (or `OPENAI_API_KEY`).
 >   It is **not** intended to be used as a general-purpose API proxy or to
 >   bypass API billing for third-party applications.
-> - **Unofficial project:** `dot` is an independent open-source project and is
+> - **Unofficial project:** `dotcker` is an independent open-source project and is
 >   not affiliated with, endorsed by, or supported by OpenAI. "ChatGPT" and
 >   "Codex" are trademarks of their respective owners.
 > - **Use at your own risk:** The optional Dots local-computer connector
@@ -31,13 +31,16 @@
 >   responsible for complying with the terms applicable to your account and for
 >   securing the directories you mount into `/workspace` (see [Security](#security)).
 
+The project was previously named `dot`. Existing `DOT_*` settings, container
+names and data volume names remain compatible.
+
 ## Architecture
 
 ```mermaid
 flowchart LR
   GUI["ChatGPT GUI / phone<br/>remote-control controller"] -->|"wss"| DOT
   API["REST / OpenAI SDK clients"] -->|"/v1/chat/completions"| DOT
-  DOT["dot container<br/>entrypoint + API :8787"] --> APP["codex app-server<br/>agent runtime"]
+  DOT["dotcker container<br/>entrypoint + API :8787"] --> APP["codex app-server<br/>agent runtime"]
   APP --> MODEL["ChatGPT models"]
   APP --> WS["/workspace<br/>mounted sandboxes"]
   DOT --> DAEMON["remote-control daemon<br/>connectable device"]
@@ -54,7 +57,7 @@ Two cooperating processes share one `CODEX_HOME`:
 Requirements: Docker with Compose v2, and a ChatGPT account.
 
 ```bash
-git clone <this repository> dot && cd dot/docker
+git clone https://github.com/EricVogt93/dotcker.git && cd dotcker/docker
 cp .env.example .env            # optional: edit
 docker compose up -d --build
 docker compose logs -f dot
@@ -253,7 +256,7 @@ probes use non-loopback Host headers). Run exactly one replica per data volume.
 
 ## CI and releases
 
-Development happens on the primary Forgejo repository. The GitHub repository is
+Development happens on the [primary Forgejo repository](https://git.ericvogt.com/root/dotcker). The [GitHub repository](https://github.com/EricVogt93/dotcker) is
 a read-only mirror and runs no workflows. [`.forgejo/workflows/ci.yml`](.forgejo/workflows/ci.yml)
 runs lint and the offline suite on Node 22 and 24, tests the deployment
 renderer, builds the image, qualifies the built image offline
@@ -269,7 +272,7 @@ configured — deploys from `main` using the exact registry digest
 | `DEPLOY_NAMESPACE` | variable | Namespace for the deploy job |
 | `KUBE_CONFIG` | secret | Kubeconfig for the deploy job |
 | `DEPLOY_KUSTOMIZATION` | secret | Content of a private overlay `kustomization.yaml` (namespace, image, storage, node placement) |
-| `GITHUB_MIRROR_REPO` | variable | GitHub mirror target (`owner/dot` or `https://github.com/owner/dot.git`) |
+| `GITHUB_MIRROR_REPO` | variable | GitHub mirror target (`owner/dotcker` or `https://github.com/owner/dotcker.git`) |
 | `GITHUB_MIRROR_TOKEN` | secret | GitHub PAT (`Contents: Read and write`) used to push `main` and tags on `main` pushes |
 
 The deploy job is skipped when any of these are missing. The `image` job
@@ -315,7 +318,7 @@ deploy/
   render.py                     # digest-pinned manifest renderer
   test_render.py                # renderer tests (kubectl kustomize, no cluster)
 docs/
-  protocol.md                   # how dot uses the Codex CLI
+  protocol.md                   # how dotcker uses the Codex CLI
   dots-executor.md              # experimental connector
 ```
 

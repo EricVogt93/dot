@@ -1,6 +1,7 @@
 # Contributing
 
-The primary repository is on Forgejo; the GitHub repository is a read-only
+The primary repository is [on Forgejo](https://git.ericvogt.com/root/dotcker);
+the [GitHub repository](https://github.com/EricVogt93/dotcker) is a read-only
 mirror without CI. Send issues and pull requests to the primary repository.
 
 ```bash

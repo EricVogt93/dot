@@ -316,8 +316,8 @@ class AppServer {
         "initialize",
         {
           clientInfo: {
-            name: "dot-container",
-            title: "Dot Container",
+            name: "dotcker",
+            title: "Dotcker",
             version: PACKAGE_VERSION,
           },
           capabilities: {
@@ -1348,7 +1348,7 @@ async function handleRemoteEnvironments(req, res) {
   }
   const headers = {
     Authorization: `Bearer ${auth.accessToken}`,
-    "User-Agent": "codex-cli/dot-container",
+    "User-Agent": "codex-cli/dotcker",
   };
   if (auth.accountId) headers["chatgpt-account-id"] = auth.accountId;
 
